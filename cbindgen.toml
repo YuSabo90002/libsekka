@@ -1,0 +1,38 @@
+language = "C"
+cpp_compat = true
+style = "both"
+include_guard = "SEKKA_H"
+autogen_warning = "/* This file is generated automatically by cbindgen. Do not edit it by hand. */"
+include_version = true
+sys_includes = ["stdint.h", "stdbool.h"]
+
+[export]
+prefix = "Sekka"
+include = []
+exclude = []
+
+[export.rename]
+
+[enum]
+rename_variants = "QualifiedScreamingSnakeCase"
+
+# The [fn] prefix/postfix options are "tokens injected before and after a function
+# declaration" (for __declspec and export macros), not a prefix for function names. The
+# functions on the Rust side are already named sekka_*, so prefix = "sekka_" was both
+# redundant and actively broken: every declaration in the generated header came out as
+# `sekka_ struct SekkaSekkaContextFfi *sekka_context_new(void)`, which does not compile as C
+# because of the undefined identifier `sekka_`. fcitx5-sekka simply never hit it, because it
+# uses hand-written declarations.
+
+[struct]
+rename_fields = "SnakeCase"
+
+[parse]
+parse_deps = false
+include = []
+extra_bindings = []
+
+[parse.expand]
+crates = []
+
+[defines]

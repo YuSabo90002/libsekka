@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: Build
+        run: cargo build --release
+      - name: Test
+        run: cargo test --all
+
+  capi:
+    name: C ABI (cargo-c)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-c
+        run: cargo install cargo-c --locked
+      - name: cinstall into a staging prefix
+        run: cargo cinstall --release --prefix="${GITHUB_WORKSPACE}/dist" --libdir=lib
+      - name: Check the installed artifacts
+        run: |
+          set -eux
+          test -f "${GITHUB_WORKSPACE}/dist/lib/pkgconfig/sekka.pc"
+          test -f "${GITHUB_WORKSPACE}/dist/lib/libsekka.so"
+          PKG_CONFIG_PATH="${GITHUB_WORKSPACE}/dist/lib/pkgconfig" pkg-config --modversion sekka
