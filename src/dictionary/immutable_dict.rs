@@ -161,7 +161,7 @@ mod tests {
     }
 
     fn mini_dict_entries() -> BTreeMap<String, Vec<DictEntry>> {
-        // Same content as e2e/fixtures/mini-dict.skk (the 6 mandatory entries of D-52).
+        // Same content as tests/fixtures/mini-dict.skk (the 6 mandatory entries of D-52).
         let mut entries: BTreeMap<String, Vec<DictEntry>> = BTreeMap::new();
         entries.insert("にほんご".to_string(), vec![DictEntry::new("日本語")]);
         entries.insert("かんj".to_string(), vec![DictEntry::new("感")]);

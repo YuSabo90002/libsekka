@@ -539,7 +539,7 @@ mod tests {
     fn eucjp_fixture_is_read_with_auto_detection() {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../e2e/fixtures/mini-dict-eucjp.skk"
+            "/tests/fixtures/mini-dict-eucjp.skk"
         ))
         .expect("failed to read the EUC-JP fixture");
         let text = decode_input(&bytes, "auto").expect("auto-detected decoding failed");
@@ -563,7 +563,7 @@ mod tests {
     fn utf8_mini_dictionary_survives_auto_detection() {
         let bytes = std::fs::read(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../e2e/fixtures/mini-dict.skk"
+            "/tests/fixtures/mini-dict.skk"
         ))
         .expect("failed to read the UTF-8 mini dictionary");
         let text = decode_input(&bytes, "auto").expect("auto-detected decoding failed");
@@ -723,7 +723,7 @@ mod tests {
         let output_path = tmp.path().join("eucjp-output.dict");
         let input_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../e2e/fixtures/mini-dict-eucjp.skk"
+            "/tests/fixtures/mini-dict-eucjp.skk"
         );
 
         convert(input_path, output_path.to_str().unwrap(), "auto", false).expect("convert failed");
@@ -746,7 +746,7 @@ mod tests {
         let output_path = tmp.path().join("readonly-output.dict");
         let input_path = concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/../e2e/fixtures/mini-dict-eucjp.skk"
+            "/tests/fixtures/mini-dict-eucjp.skk"
         );
 
         convert(input_path, output_path.to_str().unwrap(), "auto", false).expect("convert failed");
