@@ -932,8 +932,12 @@ impl SekkaContext {
     /// Order: exact matches (tier 0, score 1.0) are pushed first, then SymSpell (tier 1),
     /// then the JW<1.0 fuzzy matches (tier 2). This matches upstream's four-stage structure
     /// "exact match -> JW=1.0 -> SymSpell -> JW<1.0" (lifting the Deferred of D-58,
-    /// 03.1-01). Ascending tier order is guaranteed by `sort_candidates` (D-96), so the
-    /// push order here only matters within one tier.
+    /// 03.1-01). `sort_candidates` places the exact-match stage (tier 0) ahead of the
+    /// fuzzy stage (tier 1/2), then orders within a stage by frequency and then by tier
+    /// (D-144/D-146, replacing D-96's "frequency after tier"). The push order here only
+    /// matters for candidates that end up next to each other after that sort, and for
+    /// `learn_pair`'s first-wins (D-32/D-33). `merge_candidate` does not depend on this
+    /// push order for how it folds frequency and tier (D-147).
     ///
     /// **SymSpell part (tier 1, 03.1-01/03.1-02, all four paths):** it walks all four paths
     /// of upstream `sekka-symspell-search` (lines 181-238): path 2 (a delete variant of
