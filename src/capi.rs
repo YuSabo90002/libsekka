@@ -58,12 +58,16 @@ fn is_modifier_keysym(keysym: u32) -> bool {
 /// Romaji characters (D-20/D-21) are ASCII `a`-`z`, `A`-`Z`, `0`-`9`, the long
 /// vowel mark `-` (which becomes `ー` by the rules in romaji.rs), plus the symbols
 /// `.` `,` `@` `:` `!` `[` `]` `?` `;` `'` - that is, upstream `sekka-skip-chars`
-/// (`emacs/sekka.el:122`) minus the characters that have their own conversion
-/// branch upstream (`=` for phrase search and `` ` ``/`+` as okurigana markers;
-/// neither is implemented, so they are not accepted here). Digits are accepted
-/// together with upstream's number conversion branch (D-21,
-/// `InputShape::NumberOnly` / `NumberPrefixed`). Every other symbol and
-/// whitespace is a non-character key.
+/// (`emacs/sekka.el:122`) minus `=`, `` ` `` and `+`. Upstream buffers those three
+/// during input and only interprets them at conversion time, as a phrase-search
+/// marker (`=`) or okurigana markers (`` ` ``/`+`). Sekka does not accept them as
+/// romaji characters: buffering them would leave Ctrl-J's behavior undefined, and
+/// would not rescue other printable symbols such as `(` either (rejected for
+/// D-158). Since D-158 (Phase 9), printable keys outside `is_romaji_char`
+/// (including whitespace) are instead appended to the commit string by
+/// `dispatch_input`. Digits are accepted together with upstream's number
+/// conversion branch (D-21, `InputShape::NumberOnly` / `NumberPrefixed`). Every
+/// other symbol and whitespace is a non-character key.
 fn is_romaji_char(keysym: u32) -> bool {
     matches!(
         keysym,
@@ -418,7 +422,9 @@ pub unsafe extern "C" fn sekka_context_process_key_event(
             }
             // Other key (D-09): confirm with the selected candidate, then
             // reprocess the same key as the Input state (with an empty buffer). A
-            // character key starts new romaji input; a non-character key is forwarded.
+            // character key starts new romaji input; a printable key is appended
+            // to the confirmed candidate (D-158); a non-printable key is
+            // forwarded (D-03/D-162).
             ctx.ctx.confirm();
             let result = dispatch_input(ctx, keysym, modifiers);
             if result == 0 {
@@ -1355,6 +1361,104 @@ mod tests {
     }
 
     #[test]
+    fn is_printable_ascii_covers_exactly_0x20_to_0x7e() {
+        // D-158: pins the boundary of `is_printable_ascii` on its own, including
+        // that control keysyms outside the printable ASCII range (BackSpace,
+        // Enter, Tab, Escape, the arrow keys) are never treated as printable
+        // (09-RESEARCH Security Domain: do not append control keys as printable
+        // characters).
+        for keysym in [0x1Fu32, 0x7Fu32] {
+            assert!(!is_printable_ascii(keysym), "keysym={:#x}", keysym);
+        }
+        for keysym in [0x20u32, 0x2Bu32, 0x7Eu32] {
+            assert!(is_printable_ascii(keysym), "keysym={:#x}", keysym);
+        }
+        for keysym in [
+            0xFF08u32, 0xFF09, 0xFF0D, 0xFF1B, 0xFF51, 0xFF52, 0xFF53, 0xFF54,
+        ] {
+            assert!(!is_printable_ascii(keysym), "keysym={:#x}", keysym);
+        }
+    }
+
+    #[test]
+    fn printable_ascii_boundaries_decide_between_appending_and_forwarding() {
+        // D-158: end-to-end through dispatch_input, the same boundary values as
+        // `is_printable_ascii_covers_exactly_0x20_to_0x7e` decide between
+        // appending (0x20, 0x7E) and the D-03 commit-and-forward path (0x1F,
+        // 0x7F). Each case uses a fresh context with "k" already in the buffer.
+        unsafe {
+            for (keysym, expected_output, expected_forward) in [
+                (0x1Fu32, "k", 1),
+                (0x20, "k ", 0),
+                (0x7E, "k~", 0),
+                (0x7F, "k", 1),
+            ] {
+                let ctx = sekka_context_new();
+                sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, 0, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    expected_output,
+                    "keysym={:#x}",
+                    keysym
+                );
+                sekka_free_string(output);
+
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    expected_forward,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn a_printable_symbol_with_ctrl_alt_or_super_commits_and_forwards() {
+        // D-162: Ctrl/Alt/Super-modified printable keys are excluded from D-158
+        // (the `!ctrl && !other` guard on the is_printable_ascii branch in
+        // dispatch_input) and keep the D-03 commit-and-forward behavior, like any
+        // other modified key. Each case uses a fresh context with "k" already in
+        // the buffer.
+        unsafe {
+            for modifiers in [MOD_CTRL, MOD_ALT, MOD_SUPER] {
+                let ctx = sekka_context_new();
+                sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+
+                let consumed = sekka_context_process_key_event(ctx, 0x2B, modifiers, 0);
+                assert_eq!(consumed, 1, "modifiers={:#x}", modifiers);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "modifiers={:#x}", modifiers);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    "k",
+                    "modifiers={:#x}",
+                    modifiers
+                );
+                sekka_free_string(output);
+
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    1,
+                    "modifiers={:#x}",
+                    modifiers
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
     fn the_long_vowel_mark_accumulates_as_romaji() {
         unsafe {
             let ctx = sekka_context_new();
@@ -1382,6 +1486,26 @@ mod tests {
 
             let consumed = sekka_context_process_key_event(ctx, 0x20, 0, 0);
             assert_eq!(consumed, 0);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn a_printable_symbol_with_nothing_to_commit_is_not_consumed() {
+        // D-158: a printable symbol other than Space (which the test above already
+        // pins) is also unconsumed when there is nothing for this key event to
+        // commit (empty buffer, no staged candidate, no flush).
+        unsafe {
+            let ctx = sekka_context_new();
+
+            let consumed = sekka_context_process_key_event(ctx, 0x2B, 0, 0);
+            assert_eq!(consumed, 0);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+
             assert_eq!(sekka_context_take_forward_key(ctx), 0);
 
             sekka_context_free(ctx);
@@ -2136,6 +2260,38 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_printable_symbol_in_selection_mode_confirms_and_is_appended() {
+        // D-158: a printable symbol during reselection is an "other key" (D-09)
+        // that confirms the selected candidate, but instead of being forwarded
+        // like `other_non_character_keys_in_selection_mode_commit_and_forward`
+        // above, the symbol is appended to the confirmed candidate in a single
+        // commit and the candidate window closes.
+        unsafe {
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            // Advance to the next candidate (カ) first.
+            sekka_context_process_key_event(ctx, b'j' as u32, 0x4, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0x28, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "カ(");
+            sekka_free_string(output);
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
+            sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
+        }
+    }
+
     // === Exhaustive per-key-kind tests for the commit display state (VALIDATION.md Wave 0 Gap 3, Pitfall 1) ===
 
     /// Sends "K","a" and one Ctrl-J to reach make_commit_display_state (「か」, since
@@ -2215,6 +2371,37 @@ mod tests {
             let output = sekka_context_poll_output(ctx);
             assert!(!output.is_null());
             assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か ");
+            sekka_free_string(output);
+
+            // Confirm there is no double commit (the second poll is null).
+            let output2 = sekka_context_poll_output(ctx);
+            assert!(output2.is_null());
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
+            sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn a_printable_symbol_in_the_commit_display_state_is_appended_to_the_word() {
+        // D-158: a printable symbol other than Space (`(`) in the commit display
+        // state is appended to the displayed word in a single commit, like
+        // `a_space_in_the_commit_display_state_is_appended_to_the_word_and_not_forwarded`
+        // above but with `(` instead of Space.
+        unsafe {
+            let ctx = make_commit_display_state();
+
+            let consumed = sekka_context_process_key_event(ctx, 0x28, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か(");
             sekka_free_string(output);
 
             // Confirm there is no double commit (the second poll is null).
