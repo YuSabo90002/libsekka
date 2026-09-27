@@ -373,6 +373,36 @@ impl SekkaContext {
         true
     }
 
+    /// Commits whatever this key event commits and appends `ch` to it (D-158)
+    ///
+    /// Calls `commit_raw_romaji()` first (its own D-12 flush and romaji-buffer
+    /// commit) but ignores its return value: whether to append is decided by
+    /// whether `committed_output` ends up `Some`, not by `commit_raw_romaji`'s
+    /// return value. This matters because the caller (`dispatch_input` in
+    /// capi.rs) already ran the single D-12 flush point for this key event before
+    /// calling here; when that flush produced the commit-display word,
+    /// `committed_output` already holds it and `commit_raw_romaji`'s own internal
+    /// flush finds nothing left to flush and its romaji buffer is empty, so it
+    /// returns `false` even though there is something to append to (09-RESEARCH
+    /// Pattern 1's sketch corrected this way, Pitfall 2). This relies on
+    /// `committed_output` being empty at the start of a key event (the C++ side
+    /// polls it via `checkAndCommit()` on every consumed key).
+    ///
+    /// # Returns
+    /// true when something was committed (`ch` was appended to it),
+    /// false when there was nothing to commit (the buffer was empty, there was no
+    /// staged candidate and the D-12 flush produced nothing)
+    pub fn commit_with_trailing_char(&mut self, ch: char) -> bool {
+        self.commit_raw_romaji();
+        match &mut self.committed_output {
+            Some(text) => {
+                text.push(ch);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Deletes the last character of the romaji buffer in the preedit (BackSpace)
     ///
     /// In the Input state with a non-empty buffer, deletes the last character and updates
@@ -3059,6 +3089,41 @@ mod tests {
         assert!(committed);
         assert_eq!(ctx.poll_output(), Some("k".to_string()));
         assert_eq!(ctx.get_preedit(), "");
+    }
+
+    #[test]
+    fn commit_with_trailing_char_appends_to_whatever_this_key_event_committed() {
+        // D-158. Case (b) fixes the double-flush trap (Pitfall 2): the caller
+        // (dispatch_input in capi.rs) already ran the single D-12 flush point for
+        // this key event before calling here, so by the time
+        // commit_with_trailing_char runs, `committed_output` may already hold the
+        // commit-display word and `commit_raw_romaji`'s own internal flush finds
+        // nothing left. Deciding whether to append by `committed_output` (not by
+        // `commit_raw_romaji`'s return value) is what makes this case correct.
+
+        // (a) A plain romaji buffer ("Ctrl") gets the character appended.
+        let mut ctx = SekkaContext::new();
+        for ch in "Ctrl".chars() {
+            ctx.process_key(ch, false);
+        }
+        assert!(ctx.commit_with_trailing_char('+'));
+        assert_eq!(ctx.poll_output(), Some("Ctrl+".to_string()));
+        assert_eq!(ctx.get_preedit(), "");
+
+        // (b) The commit-display word ("あ"), already flushed by the caller before
+        // commit_with_trailing_char runs, gets the character appended too.
+        let mut ctx = SekkaContext::new();
+        ctx.process_key('a', false);
+        ctx.process_key('\0', true);
+        assert!(ctx.flush_last_commit());
+        assert!(ctx.commit_with_trailing_char('('));
+        assert_eq!(ctx.poll_output(), Some("あ(".to_string()));
+        assert!(ctx.poll_output().is_none());
+
+        // (c) Nothing to commit: returns false and produces no output.
+        let mut ctx = SekkaContext::new();
+        assert!(!ctx.commit_with_trailing_char('+'));
+        assert!(ctx.poll_output().is_none());
     }
 
     #[test]

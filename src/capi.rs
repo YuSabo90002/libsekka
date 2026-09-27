@@ -83,6 +83,20 @@ fn is_romaji_char(keysym: u32) -> bool {
     ) || keysym == b'-' as u32
 }
 
+/// Decides whether a keysym is a printable ASCII character (D-158)
+///
+/// For printable ASCII, the X11 keysym matches the code point (the same
+/// assumption `is_romaji_char` makes for `keysym as u8 as char`). This range
+/// (0x20..=0x7E) includes space and every symbol not in `is_romaji_char`
+/// (`+`, `` ` ``, `=` and so on). BackSpace (0xFF08), Enter (0xFF0D), Tab
+/// (0xFF09), Escape (0xFF1B) and the arrow keys (0xFF51..=0xFF54) are outside
+/// this range, so they keep the commit-and-forward behavior of D-03 (D-162).
+/// Non-ASCII printable keysyms (e.g. Latin-1 Supplement) are out of scope for
+/// D-158 (RESEARCH Open Question 1).
+fn is_printable_ascii(keysym: u32) -> bool {
+    (0x20..=0x7E).contains(&keysym)
+}
+
 /// Key dispatch during reselection (the Selecting state) (D-09)
 ///
 /// Returns false without deciding anything when Alt or Super is set (treated as an
@@ -179,7 +193,11 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
 /// application"). BackSpace is forwarded as it is when a flush happened (D-13) and
 /// edits the preedit otherwise; romaji character keys accumulate in the buffer;
 /// any other non-character key either commits the romaji as it is or forwards the
-/// flush result.
+/// flush result. Since D-158 (Phase 9), a printable ASCII key without
+/// Ctrl/Alt/Super that is not a romaji character (space and every symbol not
+/// accepted by `is_romaji_char`) is instead appended to whatever this key event
+/// commits and is not forwarded (D-162 keeps the Ctrl/Alt/Super and non-printable
+/// case as-is).
 fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_int {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
@@ -203,8 +221,24 @@ fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_i
         return 1;
     }
 
+    // D-158: a printable ASCII key that is not `is_romaji_char` (space, `+`, `(`,
+    // `=`, `` ` `` and so on) is appended to whatever this key event commits (the
+    // romaji buffer, or the commit-display word the D-12 flush above already
+    // produced) and goes out in a single CommitString; it is not forwarded. When
+    // there is nothing to commit it stays unconsumed and reaches the application
+    // untouched.
+    if !ctrl && !other && is_printable_ascii(keysym) {
+        return if ctx.ctx.commit_with_trailing_char(keysym as u8 as char) {
+            1
+        } else {
+            0
+        };
+    }
+
     // Anything else (non-character keys, including keys with Ctrl/Alt/Super):
-    // commit the romaji as it is and forward the key too (D-03).
+    // commit the romaji as it is and forward the key too (D-03). Since D-158
+    // (Phase 9), the only keys that reach this branch are non-printable keys and
+    // Ctrl/Alt/Super-modified keys (D-166: history kept, not erased).
     if ctx.ctx.commit_raw_romaji() {
         ctx.forward_key = true;
         return 1;
@@ -1143,7 +1177,49 @@ mod tests {
     }
 
     #[test]
-    fn non_character_keys_during_input_commit_the_romaji_and_forward() {
+    fn a_printable_symbol_during_input_is_appended_to_the_romaji_and_not_forwarded() {
+        // D-158 / COMMIT-01 tracer (todo symptom 2's keystroke sequence `C t r l +`).
+        // Before D-158, `+` (0x2B) is not `is_romaji_char`, so it fell into the
+        // "Anything else" branch: the romaji buffer ("Ctrl") was committed as-is and
+        // `+` was forwarded, losing the `+` whenever the client fails to reflect the
+        // commit before processing the forwarded key. D-158 appends the printable key
+        // to whatever this key event commits, so it goes out as a single "Ctrl+" and
+        // nothing is forwarded.
+        unsafe {
+            let ctx = sekka_context_new();
+
+            sekka_context_process_key_event(ctx, b'C' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b't' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'r' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'l' as u32, 0, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0x2B, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Ctrl+");
+            sekka_free_string(output);
+
+            let output2 = sekka_context_poll_output(ctx);
+            assert!(output2.is_null());
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
+            sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn a_space_during_input_is_appended_to_the_romaji_and_not_forwarded() {
+        // D-158 (Phase 9): Space is a printable key (`is_printable_ascii`), so it is
+        // no longer a non-character key that commits-and-forwards (D-03/D-166: this
+        // test used to be `non_character_keys_during_input_commit_the_romaji_and_forward`).
+        // It is appended to the romaji buffer's commit instead, and not forwarded.
         unsafe {
             let ctx = sekka_context_new();
 
@@ -1155,10 +1231,9 @@ mod tests {
 
             let output = sekka_context_poll_output(ctx);
             assert!(!output.is_null());
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "hi");
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "hi ");
             sekka_free_string(output);
 
-            assert_eq!(sekka_context_take_forward_key(ctx), 1);
             assert_eq!(sekka_context_take_forward_key(ctx), 0);
 
             sekka_context_free(ctx);
@@ -1190,6 +1265,9 @@ mod tests {
 
     #[test]
     fn the_case_is_preserved_on_commit() {
+        // D-158 (Phase 9): Space is now appended to the commit ("Hello ") instead of
+        // being a separate forwarded key; the case-preservation claim this test
+        // fixes is unchanged.
         unsafe {
             let ctx = sekka_context_new();
 
@@ -1202,7 +1280,7 @@ mod tests {
 
             let output = sekka_context_poll_output(ctx);
             assert!(!output.is_null());
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Hello");
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Hello ");
             sekka_free_string(output);
 
             sekka_context_free(ctx);
@@ -2082,12 +2160,14 @@ mod tests {
     #[test]
     fn a_non_character_key_in_the_commit_display_state_commits_and_forwards() {
         unsafe {
-            // Enter / Space / Escape / Tab / Right arrow / Ctrl + 'a' (the full set of
-            // non-character keys that can be pressed in the commit display state,
-            // excluding Ctrl-J, the single exception of D-12).
+            // Enter / Escape / Tab / Right arrow / Ctrl + 'a' (the non-character,
+            // non-printable keys that can be pressed in the commit display state,
+            // excluding Ctrl-J, the single exception of D-12). Space moved to
+            // `a_space_in_the_commit_display_state_is_appended_to_the_word_and_not_forwarded`
+            // with D-158 (Phase 9), since it is now a printable key that appends
+            // instead of forwarding.
             for (keysym, modifiers) in [
                 (0xFF0Du32, 0u32),
-                (0x20u32, 0u32),
                 (0xFF1Bu32, 0u32),
                 (0xFF09u32, 0u32),
                 (0xFF53u32, 0u32),
@@ -2118,6 +2198,36 @@ mod tests {
 
                 sekka_context_free(ctx);
             }
+        }
+    }
+
+    #[test]
+    fn a_space_in_the_commit_display_state_is_appended_to_the_word_and_not_forwarded() {
+        // D-158 (Phase 9): Space in the commit display state is appended to the
+        // displayed word ("か ") in a single commit and not forwarded (moved out of
+        // `a_non_character_key_in_the_commit_display_state_commits_and_forwards`).
+        unsafe {
+            let ctx = make_commit_display_state();
+
+            let consumed = sekka_context_process_key_event(ctx, 0x20, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か ");
+            sekka_free_string(output);
+
+            // Confirm there is no double commit (the second poll is null).
+            let output2 = sekka_context_poll_output(ctx);
+            assert!(output2.is_null());
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
+            sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
         }
     }
 
@@ -2171,9 +2281,10 @@ mod tests {
 
     #[test]
     fn a_symbol_only_buffer_is_raw_committed_by_space() {
-        // D-27: to type a bare symbol, the existing rule (D-03) that a non-character key
-        // (Space) commits the romaji buffer as it is applies unchanged. No symbol-specific
-        // escape hatch is added.
+        // D-27: to type a bare symbol, the existing rule that a non-character key
+        // commits the romaji buffer as it is applies unchanged. No symbol-specific
+        // escape hatch is added. D-158 (Phase 9): Space is now appended to that
+        // commit (". ") instead of being forwarded as a separate key.
         unsafe {
             let ctx = sekka_context_new();
 
@@ -2189,9 +2300,9 @@ mod tests {
             assert_eq!(consumed, 1);
             let output = sekka_context_poll_output(ctx);
             assert!(!output.is_null());
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), ".");
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), ". ");
             sekka_free_string(output);
-            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
 
             sekka_context_free(ctx);
         }
