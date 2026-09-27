@@ -254,6 +254,14 @@ struct LastCommit {
     candidates: Vec<Candidate>,
     /// The index that was selected at staging time.
     index: usize,
+    /// The romaji this word was converted from, before conversion (D-160, Phase
+    /// 9). BackSpace in the commit display state, and during reselection
+    /// (D-161), reverts to this instead of committing, deleting its last
+    /// character (see `SekkaContext::backspace`). `confirm` carries this value
+    /// over from the `last_commit` that was active before reselection began, so
+    /// a word confirmed during reselection reverts to the same original romaji
+    /// as the word it replaced.
+    raw_romaji: String,
 }
 
 /// Japanese input context
@@ -403,21 +411,47 @@ impl SekkaContext {
         }
     }
 
-    /// Deletes the last character of the romaji buffer in the preedit (BackSpace)
+    /// Reverts to the original romaji on BackSpace, or edits the romaji buffer
+    /// (D-160/D-161, Phase 9)
     ///
-    /// In the Input state with a non-empty buffer, deletes the last character and updates
-    /// the preedit with the buffer contents (the "BackSpace while there are characters in
-    /// the buffer" case of D-13). When the buffer is empty, any unsent staged candidate is
-    /// committed here (D-12/D-13; the calling capi.rs then forwards the BackSpace to the
-    /// application as it is).
+    /// D-13 used to say: in the commit display state with an empty buffer,
+    /// BackSpace committed the staged word and the caller (capi.rs) then
+    /// forwarded BackSpace to the application as it is. D-160 replaces this: the
+    /// commit display state reverts to the `raw_romaji` of `last_commit` instead
+    /// of committing it, deleting `raw_romaji`'s last character. D-161 does the
+    /// same during reselection, after first closing the candidate window (the
+    /// same three resets as `cancel`). Nothing is committed and nothing is
+    /// learned in either case (D-12's `flush_last_commit` is never called here).
+    /// When there is no staged candidate, the ordinary "delete the last character
+    /// of the romaji buffer" behaviour (Pitfall 3) is unchanged.
     ///
     /// # Returns
-    /// true when the buffer was edited, or when only a flush happened,
-    /// false when the buffer was empty, there was no staged candidate and nothing happened
+    /// true when the candidate window was closed and/or a staged candidate was
+    /// reverted to romaji, or when the buffer was edited; false when the buffer
+    /// was empty, there was no staged candidate and nothing happened
     pub fn backspace(&mut self) -> bool {
-        let flushed = self.flush_last_commit();
+        // D-161: closes the candidate window first when reselecting. `last_commit`
+        // is still Some afterward (`begin_reselect` clones it but never takes it),
+        // so the revert below still applies.
+        if self.state == ConversionState::Selecting {
+            self.state = ConversionState::Input;
+            self.candidates.clear();
+            self.candidate_index = -1;
+        }
+
+        // D-160: an unsent staged candidate reverts to its original romaji instead
+        // of being committed. `last_commit` is taken first so the invariant
+        // "last_commit Some => romaji_buffer empty" holds throughout (the buffer
+        // is written only after last_commit has become None).
+        if let Some(last) = self.last_commit.take() {
+            self.romaji_buffer = last.raw_romaji;
+            self.romaji_buffer.pop();
+            self.preedit = self.romaji_buffer.clone();
+            return true;
+        }
+
         if self.state != ConversionState::Input || self.romaji_buffer.is_empty() {
-            return flushed;
+            return false;
         }
         self.romaji_buffer.pop();
         self.preedit = self.romaji_buffer.clone();
@@ -593,11 +627,23 @@ impl SekkaContext {
             String::new()
         };
 
+        // D-160: carry over the original romaji from the last_commit that was
+        // active before reselection began (`begin_reselect` clones its candidates
+        // but never takes `last_commit`, so it is still Some here). A word
+        // confirmed during reselection must revert to the same romaji as the
+        // word it replaced.
+        let raw_romaji = self
+            .last_commit
+            .take()
+            .map(|last| last.raw_romaji)
+            .unwrap_or_default();
+
         self.preedit = output.clone();
         self.last_commit = Some(LastCommit {
             text: output,
             candidates: std::mem::take(&mut self.candidates),
             index,
+            raw_romaji,
         });
         debug_assert!(
             self.last_commit.is_none() || self.romaji_buffer.is_empty(),
@@ -731,6 +777,7 @@ impl SekkaContext {
                 text,
                 candidates: std::mem::take(&mut self.candidates),
                 index: 0,
+                raw_romaji,
             });
             debug_assert!(
                 self.last_commit.is_none() || self.romaji_buffer.is_empty(),
@@ -3133,18 +3180,26 @@ mod tests {
     }
 
     #[test]
-    fn backspace_in_the_commit_display_state_flushes_and_returns_true() {
+    fn backspace_in_the_commit_display_state_reverts_to_the_raw_romaji_without_committing() {
+        // D-13 used to say BackSpace in the commit display state commits first and
+        // is then forwarded. D-160 (Phase 9) replaces that: it reverts to the
+        // original romaji ("a" minus its last character) instead, committing
+        // nothing.
         let mut ctx = SekkaContext::new();
         ctx.process_key('a', false);
         ctx.process_key('\0', true);
         assert!(ctx.poll_output().is_none());
         assert!(ctx.last_commit.is_some());
 
-        // BackSpace in the commit display state commits first and is then forwarded (D-13).
-        let flushed = ctx.backspace();
-        assert!(flushed);
-        assert_eq!(ctx.poll_output(), Some("あ".to_string()));
+        let reverted = ctx.backspace();
+        assert!(reverted);
+        assert!(ctx.poll_output().is_none());
+        assert_eq!(ctx.get_preedit(), "");
         assert!(ctx.last_commit.is_none());
+
+        // The romaji is now exhausted, so a further BackSpace is unconsumed.
+        assert!(!ctx.backspace());
+        assert!(ctx.poll_output().is_none());
     }
 
     // === Invariants and transitions of the commit display state (VALIDATION.md Wave 0 Gaps 1 and 2) ===
@@ -3226,10 +3281,13 @@ mod tests {
         ctx.process_key('\0', true);
         assert!(ctx.poll_output().is_none());
 
-        // Pitfall 1 and D-13: it returns true even with an empty buffer and the word is committed.
-        let flushed = ctx.backspace();
-        assert!(flushed);
-        assert_eq!(ctx.poll_output(), Some("か".to_string()));
+        // Pitfall 1 and D-160 (replaces D-13): it returns true even with an empty
+        // romaji buffer, reverting to the original romaji ("ka" minus its last
+        // character) instead of committing.
+        let reverted = ctx.backspace();
+        assert!(reverted);
+        assert!(ctx.poll_output().is_none());
+        assert_eq!(ctx.get_preedit(), "k");
     }
 
     #[test]
@@ -3242,6 +3300,157 @@ mod tests {
         assert!(flushed);
         assert!(ctx.poll_output().is_none());
         assert_eq!(ctx.get_preedit(), "k");
+    }
+
+    #[test]
+    fn repeated_backspace_after_conversion_empties_the_buffer_and_then_returns_false() {
+        // D-160: once the reverted romaji itself has been fully deleted by
+        // repeated BackSpace, the next BackSpace is unconsumed (an ordinary
+        // BackSpace reaches the application from there).
+        let mut ctx = SekkaContext::new();
+        ctx.process_key('k', false);
+        ctx.process_key('a', false);
+        ctx.process_key('\0', true);
+        assert!(ctx.poll_output().is_none());
+
+        assert!(ctx.backspace());
+        assert_eq!(ctx.get_preedit(), "k");
+        assert!(ctx.poll_output().is_none());
+
+        assert!(ctx.backspace());
+        assert_eq!(ctx.get_preedit(), "");
+        assert!(ctx.poll_output().is_none());
+
+        assert!(!ctx.backspace());
+        assert!(ctx.poll_output().is_none());
+    }
+
+    #[test]
+    fn backspace_after_confirming_a_reselected_word_reverts_to_the_same_raw_romaji() {
+        // D-160/D-161: confirming a different candidate during reselection
+        // (`confirm`) carries over the original romaji from before reselection
+        // began, so BackSpace afterward reverts to that same romaji, not to the
+        // newly confirmed word's own (nonexistent) romaji.
+        let mut dict = MockDictionary::new();
+        dict.add_entry("かんじ", "漢字");
+        dict.add_entry("かんじ", "幹事");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        // "Kanji" (capitalized) requests kanji-first ordering (D-07), so the Kanji
+        // group leads and the first candidate is 漢字.
+        let first = commit_then_reselect(&mut ctx, "Kanji");
+        assert_eq!(first, "漢字");
+        ctx.next_candidate();
+        assert_eq!(
+            ctx.get_candidates()[ctx.get_candidate_index() as usize].display,
+            "幹事"
+        );
+        ctx.confirm();
+
+        assert!(ctx.backspace());
+        assert_eq!(ctx.get_preedit(), "Kanj");
+        assert!(ctx.poll_output().is_none());
+
+        ctx.process_key('i', false);
+        let staged = ctx.process_key('\0', true);
+        assert!(staged);
+        assert_eq!(ctx.get_preedit(), "漢字");
+    }
+
+    #[test]
+    fn backspace_after_cancelling_reselection_reverts_to_the_raw_romaji() {
+        // D-160/D-161: cancelling reselection (Esc/q/Ctrl-G) puts the originally
+        // committed word back into the commit display state without touching
+        // last_commit, so BackSpace afterward still reverts to the same original
+        // romaji.
+        let mut dict = MockDictionary::new();
+        dict.add_entry("かんじ", "漢字");
+        dict.add_entry("かんじ", "幹事");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        commit_then_reselect(&mut ctx, "Kanji");
+        ctx.next_candidate();
+        ctx.cancel();
+        assert_eq!(ctx.get_preedit(), "漢字");
+
+        assert!(ctx.backspace());
+        assert_eq!(ctx.get_preedit(), "Kanj");
+        assert!(ctx.poll_output().is_none());
+    }
+
+    #[test]
+    fn backspace_during_reselection_closes_the_window_and_reverts_to_the_raw_romaji() {
+        // D-161: BackSpace during reselection closes the candidate window (the
+        // same three resets as `cancel`) and reverts to the original romaji, like
+        // D-160 does in the commit display state.
+        let mut dict = MockDictionary::new();
+        dict.add_entry("かんじ", "漢字");
+        dict.add_entry("かんじ", "幹事");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        commit_then_reselect(&mut ctx, "Kanji");
+        ctx.next_candidate();
+        assert_eq!(ctx.state(), ConversionState::Selecting);
+
+        assert!(ctx.backspace());
+        assert_eq!(ctx.state(), ConversionState::Input);
+        assert!(ctx.get_candidates().is_empty());
+        assert_eq!(ctx.get_candidate_index(), -1);
+        assert_eq!(ctx.get_preedit(), "Kanj");
+        assert!(ctx.poll_output().is_none());
+    }
+
+    #[test]
+    fn backspace_to_the_raw_romaji_records_no_learning() {
+        // D-160: reverting to the romaji via BackSpace never calls
+        // flush_last_commit, so the candidate that was on screen is never
+        // recorded as learned. Part (2) below is the contrast: the same sequence
+        // but flushing instead of backspacing does learn, confirming the harness
+        // would actually catch it if BackSpace had learned too.
+        let mut master = MockDictionary::new();
+        master.add_entry("かんじ", "漢字");
+        master.add_entry("かんじ", "幹事");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        // (1) Confirm 幹事 during reselection, then BackSpace to the romaji
+        // instead of flushing: nothing is learned.
+        commit_then_reselect(&mut ctx, "Kanji");
+        ctx.next_candidate();
+        ctx.confirm();
+        assert!(ctx.backspace());
+        ctx.process_key('i', false);
+        ctx.process_key('\0', true);
+        assert_eq!(
+            ctx.get_preedit(),
+            "漢字",
+            "backspace-to-romaji must not record learning for 幹事"
+        );
+        ctx.reset();
+
+        // (2) Contrast: the same sequence but flushing (instead of BackSpace-ing)
+        // does learn, promoting 幹事 to the front of the Kanji-leading group (and
+        // therefore to the overall first candidate, since "Kanji" is capitalized).
+        commit_then_reselect(&mut ctx, "Kanji");
+        ctx.next_candidate();
+        ctx.confirm();
+        assert!(ctx.flush_last_commit());
+        ctx.poll_output();
+        let recommitted = commit_then_reselect(&mut ctx, "Kanji");
+        assert_eq!(
+            recommitted, "幹事",
+            "learning should have promoted 幹事 to first, unlike part (1)"
+        );
     }
 
     #[test]

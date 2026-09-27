@@ -109,12 +109,29 @@ fn is_printable_ascii(keysym: u32) -> bool {
 /// decided, the structure decides the whole key table before falling through to
 /// "other key"). The "other key" handling for a false return (confirm, then feed
 /// the same key to dispatch_input) is done by the caller
-/// (`sekka_context_process_key_event`).
+/// (`sekka_context_process_key_event`). Since D-161 (Phase 9), BackSpace has its
+/// own entry in this table (closes the candidate window and reverts to the
+/// original romaji, D-160) instead of falling through to "other key" like it used
+/// to.
 fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> bool {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
     if other {
         return false;
+    }
+
+    if !ctrl && keysym == 0xFF08 {
+        // D-161: closes the candidate window and reverts to the original romaji
+        // (minus its last character), matching D-160 in the commit display state.
+        // Nothing is committed and nothing is forwarded. `last_commit` is always
+        // Some while Selecting (`begin_reselect` never enters without one), so
+        // this is always consumed.
+        let consumed = ctx.ctx.backspace();
+        debug_assert!(
+            consumed,
+            "BackSpace during reselection must always be consumed (last_commit is Some)"
+        );
+        return true;
     }
 
     if ctrl {
@@ -173,7 +190,8 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
     false
 }
 
-/// Key dispatch during input (the Input state) (D-03/D-12/D-13)
+/// Key dispatch during input (the Input state) (D-03/D-12/D-13; D-160 replaces
+/// D-13's BackSpace rule, Phase 9)
 ///
 /// The trigger (start conversion / start reselection / next candidate) is split
 /// out into `sekka_context_trigger()` (D-110) and this function no longer handles
@@ -191,34 +209,40 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
 /// happening on the old Ctrl-J right after the TriggerKey is changed (pinned by
 /// the E2E tests of D-106/D-108/D-111).
 ///
-/// Everything below is non-trigger key handling: first `flush_last_commit`
-/// commits any unsent staged candidate exactly once (D-12: the single rule that
-/// "every key other than the trigger commits and forwards that key to the
-/// application"). BackSpace is forwarded as it is when a flush happened (D-13) and
-/// edits the preedit otherwise; romaji character keys accumulate in the buffer;
-/// any other non-character key either commits the romaji as it is or forwards the
-/// flush result. Since D-158 (Phase 9), a printable ASCII key without
-/// Ctrl/Alt/Super that is not a romaji character (space and every symbol not
-/// accepted by `is_romaji_char`) is instead appended to whatever this key event
-/// commits and is not forwarded (D-162 keeps the Ctrl/Alt/Super and non-printable
-/// case as-is).
+/// Everything below is non-trigger key handling. D-13 used to say: BackSpace is
+/// forwarded as it is when the D-12 flush produced output, and edits the preedit
+/// otherwise. D-160 (Phase 9) replaces this: BackSpace is judged *before* the
+/// D-12 flush (RESEARCH Pattern 2 — judging it after would commit the staged
+/// candidate first) and, in the commit display state, reverts to the original
+/// romaji instead of committing (see `SekkaContext::backspace`). For every other
+/// key, `flush_last_commit` commits any unsent staged candidate exactly once
+/// (D-12: the single rule that "every key other than the trigger and BackSpace
+/// commits and forwards that key to the application"); romaji character keys
+/// accumulate in the buffer; any other non-character key either commits the
+/// romaji as it is or forwards the flush result. Since D-158 (Phase 9), a
+/// printable ASCII key without Ctrl/Alt/Super that is not a romaji character
+/// (space and every symbol not accepted by `is_romaji_char`) is instead appended
+/// to whatever this key event commits and is not forwarded (D-162 keeps the
+/// Ctrl/Alt/Super and non-printable case as-is).
 fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_int {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
 
-    // The single flush point of D-12: commit any unsent staged candidate exactly
-    // once, here (following the Anti-Patterns entry "flushing in several places"
-    // in RESEARCH.md, this happens once per key event and only here).
-    let flushed = ctx.ctx.flush_last_commit();
-
+    // D-160: BackSpace is judged before the single D-12 flush point below
+    // (placing it after would commit the staged candidate first — RESEARCH
+    // Pattern 2). SekkaContext::backspace reverts a staged candidate to its
+    // original romaji instead of committing it; it commits nothing and forwards
+    // nothing. Once the romaji buffer is exhausted, a further BackSpace is
+    // unconsumed and reaches the application untouched, as an ordinary BackSpace.
     if !ctrl && !other && keysym == 0xFF08 {
-        if flushed {
-            // D-13: commit the word and then forward the BackSpace to the application.
-            ctx.forward_key = true;
-            return 1;
-        }
         return if ctx.ctx.backspace() { 1 } else { 0 };
     }
+
+    // The single flush point of D-12, for every key other than BackSpace: commit
+    // any unsent staged candidate exactly once, here (following the Anti-Patterns
+    // entry "flushing in several places" in RESEARCH.md, this happens once per
+    // key event and only here).
+    let flushed = ctx.ctx.flush_last_commit();
 
     if !ctrl && !other && is_romaji_char(keysym) {
         ctx.ctx.process_key(keysym as u8 as char, false);
@@ -2217,9 +2241,12 @@ mod tests {
         // D-21: '1' (a digit) became a character key in D-20/D-21, so it was removed
         // from this list (the test
         // "other_character_keys_in_selection_mode_commit_and_continue_input" above
-        // covers the character key path, digits included).
+        // covers the character key path, digits included). BackSpace (0xFF08) was
+        // removed by D-161 (Phase 9): it now has its own entry in the D-09 table
+        // (see `backspace_in_selection_mode_closes_the_window_and_reverts_to_the_romaji`
+        // below) instead of falling through to "other key" here.
         unsafe {
-            for keysym in [0xFF53u32, 0xFF09, 0xFF08] {
+            for keysym in [0xFF53u32, 0xFF09] {
                 let ctx = sekka_context_new();
                 reselection_is_entered_for_ka_without_a_dictionary(ctx);
                 // Advance to the next candidate and then press a non-character key (カ is committed and the key forwarded).
@@ -2419,23 +2446,96 @@ mod tests {
     }
 
     #[test]
-    fn backspace_in_the_commit_display_state_commits_the_word_and_forwards() {
+    fn backspace_in_the_commit_display_state_reverts_to_the_romaji_and_does_not_forward() {
+        // D-13 used to commit the word and forward BackSpace to the application;
+        // D-160 (Phase 9) replaces that with reverting to the original romaji
+        // ("Ka" minus its last character, see make_commit_display_state's doc
+        // comment) instead, committing nothing and forwarding nothing. A further
+        // BackSpace, once the romaji is exhausted, is unconsumed (0) and reaches
+        // the application as an ordinary BackSpace (the outcome still differs from
+        // BackSpace while there are characters in the romaji buffer, tested
+        // separately by `backspace_deletes_one_romaji_character`).
         unsafe {
-            // D-13: the outcome differs from BackSpace while there are characters in the
-            // romaji buffer, so this is a separate test (with a buffer, BackSpace only
-            // edits the preedit and take_forward_key is 0).
             let ctx = make_commit_display_state();
 
             let consumed = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
             assert_eq!(consumed, 1);
 
             let output = sekka_context_poll_output(ctx);
-            assert!(!output.is_null());
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か");
-            sekka_free_string(output);
-
-            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert!(output.is_null());
             assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "K");
+            sekka_free_string(preedit);
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(consumed, 1);
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
+            sekka_free_string(preedit);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(consumed, 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn backspace_in_selection_mode_closes_the_window_and_reverts_to_the_romaji() {
+        // D-161: BackSpace during reselection has its own entry in the D-09 table
+        // instead of falling through to "other key". It closes the candidate
+        // window and reverts to the original romaji ("Ka" minus its last
+        // character), matching
+        // `backspace_in_the_commit_display_state_reverts_to_the_romaji_and_does_not_forward`
+        // above (D-160).
+        unsafe {
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            // Advance to the next candidate (カ) first.
+            sekka_context_process_key_event(ctx, b'j' as u32, 0x4, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "K");
+            sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn backspace_then_retyping_after_conversion_converts_the_corrected_romaji() {
+        // CONTEXT.md D-160's own example (`K a C-j BS i C-j`): after reverting to
+        // the romaji with BackSpace, retyping the corrected letter and converting
+        // again produces an ordinary conversion, with no leftover state from the
+        // reverted word.
+        unsafe {
+            let ctx = make_commit_display_state();
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(consumed, 1);
+
+            let consumed = sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+
+            let consumed = sekka_context_trigger(ctx);
+            assert_eq!(consumed, 1);
+            let preedit = sekka_context_get_preedit(ctx);
+            assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "き");
+            sekka_free_string(preedit);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
 
             sekka_context_free(ctx);
         }
