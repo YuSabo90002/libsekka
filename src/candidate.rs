@@ -754,9 +754,12 @@ mod tests {
 
     #[test]
     fn a_lower_tier_wins_and_is_compared_between_frequency_and_score() {
-        // D-96: tier is compared after frequency and before score. A tier-1
-        // candidate loses to a tier-0 one even with a higher score (same group,
-        // same frequency).
+        // Under D-144 (Phase 8, replacing D-96's "frequency before tier"), the
+        // match stage (`match_stage(tier)`) is compared before frequency, and
+        // `tier` itself is still compared after frequency and before score.
+        // Here both candidates have the same frequency (0), so D-96 and D-144
+        // produce the same result: a tier-1 candidate still loses to a tier-0
+        // one even with a higher score (same group, same frequency).
         let mut candidates = vec![
             Candidate {
                 display: "SymSpell候補".to_string(),
@@ -784,8 +787,10 @@ mod tests {
 
     #[test]
     fn with_equal_tiers_descending_score_still_applies() {
-        // With equal tiers the comparison is by descending score as before
-        // (confirming D-96 did not change existing behaviour).
+        // Under D-96, and under D-144 (Phase 8, replacing D-96's "frequency
+        // before tier"), descending score inside the same tier is unchanged:
+        // both candidates share the same match stage (tier 1), so the stage
+        // comparison is a no-op here and score still decides the order.
         let mut candidates = vec![
             Candidate {
                 display: "低スコア".to_string(),
@@ -849,6 +854,215 @@ mod tests {
         assert_eq!(candidates[0].display, "漢字");
         assert_eq!(candidates[1].display, "幹事");
         assert_eq!(candidates[2].display, "かんじ");
+    }
+
+    #[test]
+    fn match_stage_maps_tier_0_to_the_exact_stage_and_tiers_1_and_2_to_the_fuzzy_stage() {
+        // D-144: the match stage is a 2-value grouping derived from tier. Tier
+        // 0 (exact match / JW=1.0) is stage 0; tiers 1 (SymSpell) and 2
+        // (JW<1.0) both fall into stage 1 (fuzzy), so they compare equal here.
+        assert_eq!(match_stage(0), 0);
+        assert_eq!(match_stage(1), 1);
+        assert_eq!(match_stage(2), 1);
+    }
+
+    #[test]
+    fn an_unlearned_exact_match_outranks_learned_fuzzy_candidates() {
+        // RANK-01 / D-144: no amount of learning on a fuzzy candidate (tier 1
+        // or 2) should let it outrank an unlearned exact match (tier 0). This
+        // is the regression this phase fixes - under D-96 (frequency before
+        // tier), the SymSpell candidate's frequency of 5 would have put it
+        // ahead of the unlearned exact match.
+        let mut candidates = vec![
+            Candidate {
+                display: "SymSpell学習済み".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 5,
+                tier: 1,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "JW学習済み".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.99,
+                frequency: 5,
+                tier: 2,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "完全一致未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.5,
+                frequency: 0,
+                tier: 0,
+                learn_pair: None,
+            },
+        ];
+        sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
+        assert_eq!(candidates[0].display, "完全一致未学習");
+        assert_eq!(candidates[1].display, "SymSpell学習済み");
+        assert_eq!(candidates[2].display, "JW学習済み");
+    }
+
+    #[test]
+    fn a_learned_exact_match_outranks_unlearned_exact_matches() {
+        // RANK-02 / D-150: inside the exact-match stage, learning still wins,
+        // exactly as it did under D-96. This test keeps the original intent
+        // of D-96 (a learned candidate wins inside the exact-match group)
+        // alive under the new D-144 ordering, as a separate test from the
+        // RANK-01 regression above.
+        let mut candidates = vec![
+            Candidate {
+                display: "完全一致未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 0,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "完全一致学習済み".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.5,
+                frequency: 3,
+                tier: 0,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "SymSpell未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 1,
+                learn_pair: None,
+            },
+        ];
+        sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
+        assert_eq!(candidates[0].display, "完全一致学習済み");
+        assert_eq!(candidates[1].display, "完全一致未学習");
+        assert_eq!(candidates[2].display, "SymSpell未学習");
+    }
+
+    #[test]
+    fn a_learned_tier_2_candidate_outranks_an_unlearned_tier_1_candidate() {
+        // D-146: tier 1 and tier 2 share the same match stage, so a learned
+        // tier-2 candidate (JW<1.0) still outranks an unlearned tier-1 one
+        // (SymSpell) - frequency is compared before tier. Implementing the
+        // stage as a 3-value comparison on `tier` itself (instead of the
+        // 2-value `match_stage`) would make this test fail: tier 1 would
+        // always sort ahead of tier 2 regardless of frequency (08-RESEARCH.md
+        // Pitfall 3).
+        let mut candidates = vec![
+            Candidate {
+                display: "SymSpell未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 1,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "JW学習済み".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.95,
+                frequency: 1,
+                tier: 2,
+                learn_pair: None,
+            },
+        ];
+        sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
+        assert_eq!(candidates[0].display, "JW学習済み");
+        assert_eq!(candidates[1].display, "SymSpell未学習");
+    }
+
+    #[test]
+    fn unlearned_fuzzy_candidates_keep_tier_1_before_tier_2() {
+        // D-146 / D-148: with no learning on either side (equal frequency),
+        // the fuzzy stage falls back to comparing `tier` before `score`, so
+        // tier 1 (SymSpell) still comes before tier 2 (JW<1.0) even when
+        // tier 2 has the higher score.
+        let mut candidates = vec![
+            Candidate {
+                display: "JW未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.99,
+                frequency: 0,
+                tier: 2,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "SymSpell未学習".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.5,
+                frequency: 0,
+                tier: 1,
+                learn_pair: None,
+            },
+        ];
+        sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
+        assert_eq!(candidates[0].display, "SymSpell未学習");
+        assert_eq!(candidates[1].display, "JW未学習");
+    }
+
+    #[test]
+    fn a_learned_fuzzy_candidate_leads_the_fuzzy_stage_behind_every_exact_match() {
+        // D-145 (a copy of the Ato example from context.rs): a fuzzy
+        // candidate learned under another reading (元, tier 1, frequency 1)
+        // leads the fuzzy stage - ahead of the unlearned tier-1 candidate
+        // (基) - but stays behind every exact match (後/跡, tier 0), no
+        // matter how much it has been learned.
+        let mut candidates = vec![
+            Candidate {
+                display: "基".to_string(),
+                reading: "あと".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 1,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "元".to_string(),
+                reading: "あと".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 1,
+                tier: 1,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "後".to_string(),
+                reading: "あと".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 0,
+                learn_pair: None,
+            },
+            Candidate {
+                display: "跡".to_string(),
+                reading: "あと".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 0,
+                learn_pair: None,
+            },
+        ];
+        sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
+        let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(displays, vec!["後", "跡", "元", "基"]);
     }
 
     #[test]
