@@ -69,7 +69,7 @@ cargo build --release --bin sekka-dict-tool
 sled の排他ロックにより実行できない）。
 
 ```sh
-./target/release/sekka-dict-tool dump ~/.local/share/sekka/user-dict.db
+./target/release/sekka-dict-tool dump ~/.local/share/fcitx5/sekka/user-dict.db
 ```
 
 ## ライセンス

@@ -75,7 +75,7 @@ Use `dump` to inspect the contents of a user dictionary (it cannot run while fci
 same dictionary open, because of sled's exclusive lock):
 
 ```sh
-./target/release/sekka-dict-tool dump ~/.local/share/sekka/user-dict.db
+./target/release/sekka-dict-tool dump ~/.local/share/fcitx5/sekka/user-dict.db
 ```
 
 ## License
