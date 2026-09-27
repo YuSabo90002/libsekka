@@ -88,22 +88,31 @@ fn okuri_key_suffix(okuri_romaji: &str) -> Option<char> {
 ///   exact match of the same word (RANK-01). When an exact match arrives
 ///   after a fuzzy duplicate (not reachable through the current push order,
 ///   see `lookup_dictionary`'s "Order:" paragraph, but not assumed here),
-///   the exact match's own frequency replaces the fuzzy one's
+///   the exact match's own frequency replaces the fuzzy one's, and (for the same
+///   reason) its `learn_pair` replaces the fuzzy one's too
 /// - `tier`: folded by minimum (D-147, Pitfall 7), so this does not silently
 ///   depend on `lookup_dictionary` always pushing tier 0 before tier 1/2
 /// - `score`: take the maximum
-/// - `learn_pair`: **first wins** (whatever became `Some` first is kept and is never
-///   overwritten by the `learn_pair` of a later candidate)
+/// - `learn_pair`: **first wins within a stage** (whatever became `Some` first among
+///   candidates of the same match stage is kept and is never overwritten by the
+///   `learn_pair` of a later same-stage candidate). When an exact match arrives after
+///   a fuzzy duplicate (the same defensive, currently-unreached branch described
+///   above for `frequency`), the exact match's own `learn_pair` takes over instead,
+///   for the same reason as `frequency` (D-147)
 ///
-/// Why only `learn_pair` is first-wins: `learn_pair` is the **provenance** (D-32 /
-/// D-33) of "which reading and word pair to record into the user dictionary when this
-/// candidate is committed", and the reading of the lookup that first generated the
-/// candidate is the correct thing to record. Because the dictionary holds okuri-ari
-/// verbs under one key per conjugating consonant (G-01.1-6a), the same spelling can be
-/// generated from several reading keys, but the one to record is the reading that hit
-/// first. Changing it to "last wins" or "merge", as `frequency` does, would surface as
-/// learning that does not take effect or that is recorded against a different reading.
-/// This asymmetry is intentional.
+/// Why only `learn_pair` is first-wins (within a stage): `learn_pair` is the
+/// **provenance** (D-32 / D-33) of "which reading and word pair to record into the
+/// user dictionary when this candidate is committed", and the reading of the lookup
+/// that first generated the candidate is the correct thing to record. Because the
+/// dictionary holds okuri-ari verbs under one key per conjugating consonant
+/// (G-01.1-6a), the same spelling can be generated from several reading keys, but the
+/// one to record is the reading that hit first. Changing it to "last wins" or "merge",
+/// as `frequency` does, would surface as learning that does not take effect or that is
+/// recorded against a different reading. This asymmetry is intentional. The one
+/// exception is the cross-stage, exact-after-fuzzy case: learning is recorded per
+/// reading (D-34/D-37), so a tier-0 candidate must be recorded under its own exact
+/// reading rather than under an unrelated fuzzy reading that merely happened to arrive
+/// first (D-147).
 fn merge_candidate(
     all: &mut Vec<Candidate>,
     seen: &mut HashMap<String, usize>,
@@ -123,6 +132,12 @@ fn merge_candidate(
             // through the current push order (tier 0 -> 1 -> 2), but only the
             // exact match's own frequency must survive here (D-147, Pitfall 2).
             existing.frequency = candidate.frequency;
+            // For the same reason: learning is recorded per reading (D-34/D-37),
+            // so a tier-0 candidate must be recorded under its own exact reading,
+            // not the unrelated fuzzy reading that happened to arrive first.
+            if candidate.learn_pair.is_some() {
+                existing.learn_pair = candidate.learn_pair;
+            }
         }
         // candidate_stage > existing_stage: a fuzzy-stage duplicate arrived after
         // an exact match. Its frequency must never be carried into the exact
@@ -2310,6 +2325,11 @@ mod tests {
             "only the exact match's own frequency survives when it arrives after a fuzzy duplicate"
         );
         assert_eq!(all[0].score, 1.0, "score still folds by maximum");
+        assert_eq!(
+            all[0].learn_pair,
+            Some(("かく".to_string(), "角".to_string())),
+            "learn_pair also takes the exact match's own reading when it arrives after a fuzzy duplicate (D-147)"
+        );
     }
 
     #[test]
