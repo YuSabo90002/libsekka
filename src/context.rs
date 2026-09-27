@@ -934,7 +934,7 @@ impl SekkaContext {
     /// "exact match -> JW=1.0 -> SymSpell -> JW<1.0" (lifting the Deferred of D-58,
     /// 03.1-01). `sort_candidates` places the exact-match stage (tier 0) ahead of the
     /// fuzzy stage (tier 1/2), then orders within a stage by frequency and then by tier
-    /// (D-144/D-146, replacing D-96's "frequency after tier"). The push order here only
+    /// (D-144/D-146, replacing D-96's "frequency before tier"). The push order here only
     /// matters for candidates that end up next to each other after that sort, and for
     /// `learn_pair`'s first-wins (D-32/D-33). `merge_candidate` does not depend on this
     /// push order for how it folds frequency and tier (D-147).
