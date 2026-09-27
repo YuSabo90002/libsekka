@@ -10,7 +10,7 @@
 
 use crate::candidate::{
     alphabet_hankaku_candidate, alphabet_zenkaku_candidate, build_candidates, hiragana_candidate,
-    katakana_candidate, sharp_number, sort_candidates, Candidate, CandidateKind,
+    katakana_candidate, match_stage, sharp_number, sort_candidates, Candidate, CandidateKind,
 };
 use crate::conversion::{analyze_input, classify_input_shape, split_okuri, InputShape};
 use std::collections::HashMap;
@@ -66,11 +66,12 @@ fn okuri_key_suffix(okuri_romaji: &str) -> Option<char> {
 
 /// Merges dictionary-derived candidates by display string (deduplicating on display)
 ///
-/// Keeps the first candidate that appears (the score-1.0 candidate from the exact
-/// match path) and only folds in the maximum frequency and score. The same spelling
-/// gets generated several times both because the dictionary holds okuri-ari verbs
-/// under one key per conjugating consonant (G-01.1-6a) and because the same word
-/// exists in the master and user dictionaries, so it is folded at merge time.
+/// Keeps the first candidate that appears and folds the remaining fields into it
+/// per the rules below (D-147, replacing the old "always take the maximum
+/// frequency and score" rule). The same spelling gets generated several times
+/// both because the dictionary holds okuri-ari verbs under one key per
+/// conjugating consonant (G-01.1-6a) and because the same word exists in the
+/// master and user dictionaries, so it is folded at merge time.
 ///
 /// Deduplication is confined to this scope (dictionary-derived candidates). The four
 /// fallback candidates `build_candidate_list` appends - hiragana, katakana,
@@ -79,7 +80,17 @@ fn okuri_key_suffix(okuri_romaji: &str) -> Option<char> {
 /// longer be able to point at the first candidate of each kind).
 ///
 /// Per-field merge rules:
-/// - `frequency`: take the maximum
+/// - `frequency`: folded by maximum only among candidates from the same match
+///   stage (`match_stage`, D-147). A fuzzy-stage (tier 1/2) duplicate's
+///   frequency is never carried into an exact-match (tier 0) duplicate,
+///   because learning is recorded per reading (D-34/D-37): a word learned
+///   under one reading's fuzzy hit must not push up a different reading's
+///   exact match of the same word (RANK-01). When an exact match arrives
+///   after a fuzzy duplicate (not reachable through the current push order,
+///   see `lookup_dictionary`'s "Order:" paragraph, but not assumed here),
+///   the exact match's own frequency replaces the fuzzy one's
+/// - `tier`: folded by minimum (D-147, Pitfall 7), so this does not silently
+///   depend on `lookup_dictionary` always pushing tier 0 before tier 1/2
 /// - `score`: take the maximum
 /// - `learn_pair`: **first wins** (whatever became `Some` first is kept and is never
 ///   overwritten by the `learn_pair` of a later candidate)
@@ -100,11 +111,27 @@ fn merge_candidate(
 ) {
     if let Some(&index) = seen.get(&candidate.display) {
         let existing = &mut all[index];
-        if candidate.frequency > existing.frequency {
+        let existing_stage = match_stage(existing.tier);
+        let candidate_stage = match_stage(candidate.tier);
+        if candidate_stage == existing_stage {
+            // Same stage: fold frequency by maximum, exactly as before D-147.
+            if candidate.frequency > existing.frequency {
+                existing.frequency = candidate.frequency;
+            }
+        } else if candidate_stage < existing_stage {
+            // An exact match arrived after a fuzzy duplicate. Not reachable
+            // through the current push order (tier 0 -> 1 -> 2), but only the
+            // exact match's own frequency must survive here (D-147, Pitfall 2).
             existing.frequency = candidate.frequency;
         }
+        // candidate_stage > existing_stage: a fuzzy-stage duplicate arrived after
+        // an exact match. Its frequency must never be carried into the exact
+        // match (D-147, RANK-01) - leave `existing.frequency` untouched.
         if candidate.score > existing.score {
             existing.score = candidate.score;
+        }
+        if candidate.tier < existing.tier {
+            existing.tier = candidate.tier;
         }
     } else {
         seen.insert(candidate.display.clone(), all.len());
@@ -2106,6 +2133,182 @@ mod tests {
     }
 
     #[test]
+    fn merge_candidate_does_not_carry_a_fuzzy_frequency_into_an_exact_match() {
+        // D-147: a fuzzy-stage duplicate (tier 1/2) of an exact match (tier 0) must
+        // not lift the exact match's frequency. Calls `merge_candidate` directly
+        // (through `use super::*`) rather than going through a dictionary lookup,
+        // to pin the merge rule itself regardless of push order.
+        let mut all: Vec<Candidate> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "角".to_string(),
+                reading: "かく".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 0,
+                learn_pair: Some(("かく".to_string(), "角".to_string())),
+            },
+        );
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "角".to_string(),
+                reading: "かど".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 5,
+                tier: 1,
+                learn_pair: Some(("かど".to_string(), "角".to_string())),
+            },
+        );
+
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].frequency, 0,
+            "a fuzzy-stage frequency (learned under a different reading) must not be carried into the exact match"
+        );
+        assert_eq!(all[0].tier, 0);
+        assert_eq!(
+            all[0].learn_pair,
+            Some(("かく".to_string(), "角".to_string())),
+            "learn_pair stays first-wins even across the stage boundary"
+        );
+    }
+
+    #[test]
+    fn merge_candidate_folds_frequency_by_maximum_within_the_same_stage() {
+        // D-147/D-148: duplicates that share the same match stage still fold their
+        // frequency by maximum, exactly as before D-147. Tier 1 and tier 2 share
+        // the fuzzy stage, so a tier-1/tier-2 duplicate also folds by maximum.
+        let mut all: Vec<Candidate> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "漢字".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 0,
+                tier: 0,
+                learn_pair: None,
+            },
+        );
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "漢字".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 7,
+                tier: 0,
+                learn_pair: None,
+            },
+        );
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "幹事".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 2,
+                tier: 1,
+                learn_pair: None,
+            },
+        );
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "幹事".to_string(),
+                reading: "かんじ".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.95,
+                frequency: 4,
+                tier: 2,
+                learn_pair: None,
+            },
+        );
+
+        let kanji = all.iter().find(|c| c.display == "漢字").unwrap();
+        assert_eq!(kanji.frequency, 7);
+        assert_eq!(kanji.tier, 0);
+
+        let kanji_ = all.iter().find(|c| c.display == "幹事").unwrap();
+        assert_eq!(
+            kanji_.frequency, 4,
+            "tier 1 and tier 2 share the fuzzy stage, so they still fold by maximum"
+        );
+        assert_eq!(
+            kanji_.tier, 1,
+            "tier folds to the minimum of the involved candidates (D-147, Pitfall 7)"
+        );
+    }
+
+    #[test]
+    fn merge_candidate_takes_the_exact_match_frequency_and_tier_when_an_exact_match_arrives_after_a_fuzzy_one(
+    ) {
+        // D-147/D-148 (Pitfall 2/7): the reverse push order (fuzzy, then exact) is
+        // not reachable through the current `lookup_dictionary` call order (tier 0
+        // -> 1 -> 2, Open Items Resolved 4 of 08-RESEARCH.md), but `merge_candidate`
+        // must not depend on that order to produce the correct result: only the
+        // exact match's frequency and tier survive, and score still folds by
+        // maximum.
+        let mut all: Vec<Candidate> = Vec::new();
+        let mut seen: HashMap<String, usize> = HashMap::new();
+
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "角".to_string(),
+                reading: "かど".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 0.95,
+                frequency: 5,
+                tier: 2,
+                learn_pair: Some(("かど".to_string(), "角".to_string())),
+            },
+        );
+        merge_candidate(
+            &mut all,
+            &mut seen,
+            Candidate {
+                display: "角".to_string(),
+                reading: "かく".to_string(),
+                kind: CandidateKind::Kanji,
+                score: 1.0,
+                frequency: 1,
+                tier: 0,
+                learn_pair: Some(("かく".to_string(), "角".to_string())),
+            },
+        );
+
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].tier, 0,
+            "tier folds to the minimum (the exact match's tier), Pitfall 7"
+        );
+        assert_eq!(
+            all[0].frequency, 1,
+            "only the exact match's own frequency survives when it arrives after a fuzzy duplicate"
+        );
+        assert_eq!(all[0].score, 1.0, "score still folds by maximum");
+    }
+
+    #[test]
     fn the_4_mandatory_fallbacks_stay_within_the_first_10_in_a_realistic_setup() {
         let mut ctx = SekkaContext::new();
         ctx.add_dictionary(Arc::new(realistic_mock_dictionary()));
@@ -3357,6 +3560,113 @@ mod tests {
         // Third round: Moto should still commit 元 first (RANK-02 unaffected).
         let recommitted = commit_then_reselect(&mut ctx, "Moto");
         assert_eq!(recommitted, "元");
+    }
+
+    #[test]
+    fn learning_a_word_under_a_neighbouring_reading_does_not_lift_it_among_exact_matches() {
+        // D-147 / RANK-02: recording a selection under one reading (かど) must not
+        // let the fuzzy-stage frequency it creates carry into a different reading's
+        // (かく) exact match of the same word (角). `MockDictionary` has no
+        // `symspell_bucket` of its own (same setup as
+        // `a_fuzzy_candidate_learned_under_another_reading_never_outranks_exact_matches`
+        // above), so before any learning happens the only source of a SymSpell hit
+        // between かく and かど is the UserDict's index, which `record_selection`
+        // builds only once かど has actually been confirmed. 門 (also under かど,
+        // never selected) is the witness that the かど SymSpell bucket really is
+        // feeding かく's fuzzy stage: if it is missing, the merge never crossed the
+        // stage boundary D-147 guards, and the test would pass for the wrong reason.
+        let mut master = MockDictionary::new();
+        master.add_entry("かく", "核");
+        master.add_entry("かく", "格");
+        master.add_entry("かく", "角");
+        master.add_entry("かど", "角");
+        master.add_entry("かど", "門");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        // First round: learn 角 under the かど reading.
+        let committed = commit_then_reselect(&mut ctx, "Kado");
+        assert_eq!(committed, "角");
+        ctx.confirm();
+        assert!(ctx.poll_output().is_none());
+        assert!(ctx.flush_last_commit());
+        ctx.poll_output();
+
+        // Second round: read かく. 角 there is an exact match, unlearned under かく
+        // itself; its frequency must stay 0 even though かど's SymSpell bucket now
+        // really does feed かく's fuzzy stage (witnessed by 門, tier 1).
+        let first = commit_then_reselect(&mut ctx, "Kaku");
+        let displays: Vec<&str> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.as_str())
+            .collect();
+        let mon_candidate = ctx.get_candidates().iter().find(|c| c.display == "門");
+        assert_eq!(
+            mon_candidate.map(|c| c.tier),
+            Some(1),
+            "門 (only reachable from かど) must appear as a tier-1 candidate for Kaku, proving the かど bucket fed かく: {:?}",
+            displays
+        );
+        let kaku_matches: Vec<&Candidate> = ctx
+            .get_candidates()
+            .iter()
+            .filter(|c| c.display == "角")
+            .collect();
+        assert_eq!(
+            kaku_matches.len(),
+            1,
+            "角 must be deduplicated to a single candidate: {:?}",
+            displays
+        );
+        assert_eq!(
+            kaku_matches[0].tier, 0,
+            "角 must stay an exact match (tier 0) for Kaku: {:?}",
+            displays
+        );
+        assert_eq!(
+            kaku_matches[0].frequency, 0,
+            "角 must not carry over the frequency learned under かど (D-147, RANK-01): {:?}",
+            displays
+        );
+        assert_eq!(
+            first, "核",
+            "an unlearned exact match (核) must not be outranked by 角's borrowed frequency: {:?}",
+            displays
+        );
+        assert_eq!(
+            &displays[..4],
+            &["核", "格", "角", "門"],
+            "the exact matches must stay ahead of the fuzzy stage: {:?}",
+            displays
+        );
+
+        // Learn 角 under its own reading (かく) too - same-stage learning (RANK-02)
+        // must keep working after D-147.
+        ctx.next_candidate();
+        ctx.next_candidate();
+        assert_eq!(
+            ctx.get_candidates()[ctx.get_candidate_index() as usize].display,
+            "角"
+        );
+        ctx.confirm();
+        assert!(ctx.poll_output().is_none());
+        assert!(ctx.flush_last_commit());
+        ctx.poll_output();
+
+        // Third round: かく's own learning must now take effect.
+        let recommitted = commit_then_reselect(&mut ctx, "Kaku");
+        assert_eq!(
+            recommitted, "角",
+            "learning under the matching reading (かく) must promote 角 (RANK-02)"
+        );
     }
 
     #[test]
