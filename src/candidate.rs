@@ -56,12 +56,22 @@ pub struct Candidate {
     /// Selection frequency in the user dictionary.
     pub frequency: u32,
     /// Candidate tier (D-96, 03.1-01). 0 = exact match and JW=1.0, 1 = SymSpell
-    /// (distance 1), 2 = JW<1.0. Lower wins. Scores for JW<1.0 run continuously
-    /// from 0.94 up to just below 1.0, so placing SymSpell "after JW=1.0 and
-    /// before JW<1.0" cannot be expressed by a single score value and needs its
-    /// own field. Generated candidates (hiragana, katakana, full-width and
-    /// half-width alphabet) are always `0`, since `group_rank` already separates
-    /// them from dictionary candidates.
+    /// (distance 1), 2 = JW<1.0. Scores for JW<1.0 run continuously from 0.94
+    /// up to just below 1.0, so placing SymSpell "after JW=1.0 and before
+    /// JW<1.0" cannot be expressed by a single score value and needs its own
+    /// field.
+    ///
+    /// `sort_candidates` derives the match stage from this value with
+    /// `match_stage` (D-144: tier 0 -> stage 0, tiers 1 and 2 -> stage 1) and
+    /// compares the stage before frequency, replacing D-96's "frequency before
+    /// tier" (03.1-01) so a fuzzy candidate learned under a different reading
+    /// can no longer outrank an unlearned exact match (RANK-01). `tier` itself
+    /// is still compared after frequency, inside the fuzzy stage, so a learned
+    /// tier-2 candidate keeps outranking an unlearned tier-1 one (D-146).
+    /// Generated candidates (hiragana, katakana, full-width and half-width
+    /// alphabet) are always `0`, but never take part in the stage comparison:
+    /// `group_rank` already separates them from dictionary candidates before
+    /// the stage is even compared.
     pub tier: u8,
     /// Learning pair (dictionary key, raw word as stored in the dictionary) (D-33)
     ///
@@ -104,19 +114,44 @@ fn group_rank(kind: &CandidateKind, mode: ConversionMode) -> u8 {
     }
 }
 
+/// Maps a candidate's `tier` to its match stage (D-144)
+///
+/// The match stage is a 2-value grouping used by `sort_candidates` to keep
+/// every exact match ahead of every fuzzy match, regardless of learning:
+/// tier 0 (exact match / JW=1.0) maps to stage 0, and tiers 1 (SymSpell) and 2
+/// (JW<1.0) both map to stage 1 (fuzzy). `Candidate` gets no new field for
+/// this - the stage is always derived from `tier`.
+pub(crate) fn match_stage(tier: u8) -> u8 {
+    if tier == 0 {
+        0
+    } else {
+        1
+    }
+}
+
 /// Sorts a list of conversion candidates
 ///
-/// Sorting follows this priority (D-07 / D-96):
+/// Sorting follows this priority:
 /// 1. group rank (ascending) - the fixed category order for the conversion mode
-/// 2. selection frequency (descending) - only effective within a group
-/// 3. tier (ascending) - exact match/JW=1.0 (0) -> SymSpell (1) -> JW<1.0 (2).
-///    Placing it after frequency keeps the existing behaviour where a learned
-///    candidate wins inside its group (D-07/Phase 01.4)
-/// 4. similarity score (descending) - only effective within one tier
+/// 2. match stage (ascending) - `match_stage(tier)` (D-144). Exact match (tier 0)
+///    always outranks fuzzy match (tier 1 or 2), no matter how much a fuzzy
+///    candidate has been learned. D-96 (Phase 03.1) used to compare frequency
+///    before tier, which let a fuzzy candidate learned under a different
+///    reading overtake an unlearned exact match (RANK-01); D-144 (Phase 8)
+///    replaces that by inserting this stage ahead of frequency.
+/// 3. selection frequency (descending) - only effective within one stage, so a
+///    learned candidate still wins inside the exact-match stage (RANK-02) and
+///    inside the fuzzy stage (D-145)
+/// 4. tier (ascending) - exact match/JW=1.0 (0) -> SymSpell (1) -> JW<1.0 (2).
+///    Only breaks ties within the fuzzy stage, where tier 1 and tier 2 already
+///    share the same stage value (D-146: a learned tier-2 candidate still
+///    outranks an unlearned tier-1 one, because frequency is compared first)
+/// 5. similarity score (descending) - only effective within one tier
 pub fn sort_candidates(candidates: &mut [Candidate], mode: ConversionMode) {
     candidates.sort_by(|a, b| {
         group_rank(&a.kind, mode)
             .cmp(&group_rank(&b.kind, mode))
+            .then_with(|| match_stage(a.tier).cmp(&match_stage(b.tier)))
             .then_with(|| b.frequency.cmp(&a.frequency))
             .then_with(|| a.tier.cmp(&b.tier))
             .then_with(|| {

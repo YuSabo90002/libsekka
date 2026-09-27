@@ -3278,6 +3278,88 @@ mod tests {
     }
 
     #[test]
+    fn a_fuzzy_candidate_learned_under_another_reading_never_outranks_exact_matches() {
+        // RANK-01 / D-144 / D-148: a fuzzy candidate learned under one reading
+        // must never let a different reading's exact match fall behind it.
+        // `MockDictionary` does not implement `symspell_bucket` (it keeps the
+        // default, empty implementation), so before any learning happens the
+        // only source of a SymSpell hit between あと and もと is the UserDict's
+        // index built by `record_selection` (`もと` gets indexed only after it
+        // is confirmed once). Before that, Ato never sees 基/元 as candidates.
+        let mut master = MockDictionary::new();
+        master.add_entry("あと", "後");
+        master.add_entry("あと", "跡");
+        master.add_entry("もと", "基");
+        master.add_entry("もと", "元");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        // First round: learn 元 under the もと reading (RANK-02: exact match
+        // learning is unaffected by D-144).
+        let committed = commit_then_reselect(&mut ctx, "Moto");
+        assert_eq!(committed, "基");
+        ctx.next_candidate();
+        assert_eq!(
+            ctx.get_candidates()[ctx.get_candidate_index() as usize].display,
+            "元"
+        );
+        ctx.confirm();
+        assert!(ctx.poll_output().is_none());
+        assert!(ctx.flush_last_commit());
+        ctx.poll_output();
+
+        // Second round: read Ato. The learned 元 must show up (not a fluke of
+        // an empty candidate list) with tier 1 and frequency >= 1, coming from
+        // the UserDict's SymSpell index that record_selection just populated.
+        let first = commit_then_reselect(&mut ctx, "Ato");
+        let displays: Vec<&str> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.as_str())
+            .collect();
+        let moto_candidate = ctx
+            .get_candidates()
+            .iter()
+            .find(|c| c.display == "元")
+            .unwrap_or_else(|| panic!("元 is missing from the Ato candidate list: {:?}", displays));
+        assert_eq!(
+            moto_candidate.tier, 1,
+            "元 should be a SymSpell (tier 1) candidate for Ato: {:?}",
+            displays
+        );
+        assert!(
+            moto_candidate.frequency >= 1,
+            "元 should carry the learned frequency: {:?}",
+            displays
+        );
+        assert_eq!(
+            first, "後",
+            "an unlearned exact match (後) must not be outranked by a fuzzy candidate learned under another reading (RANK-01): {:?}",
+            displays
+        );
+        assert_eq!(
+            &displays[..4],
+            &["後", "跡", "元", "基"],
+            "the learned fuzzy candidate (元) should lead the fuzzy stage, behind every exact match (D-145): {:?}",
+            displays
+        );
+
+        // reset() discards the read-only Ato conversion without learning it (D-06).
+        ctx.reset();
+
+        // Third round: Moto should still commit 元 first (RANK-02 unaffected).
+        let recommitted = commit_then_reselect(&mut ctx, "Moto");
+        assert_eq!(recommitted, "元");
+    }
+
+    #[test]
     fn okuri_ari_learning_records_the_raw_word_before_okurigana_is_appended_and_never_doubles_it() {
         // Row 1 of the D-33 table: pins that the raw word 「感」 held by learn_pair is recorded
         // rather than the display (「感じ」, after the okurigana was appended), and that
