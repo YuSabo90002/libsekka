@@ -5191,4 +5191,223 @@ mod tests {
         assert!(ctx.poll_output().is_none());
         assert_eq!(ctx.registration_word(), Some(String::new()));
     }
+
+    // === D-171 unbounded-recursion worked example (Phase 10, 10-03) ===
+
+    /// D-171's own worked example: せき -> 石 is registered first, nested
+    /// inside registering せっか -> 石火 - the exact keystroke sequence from
+    /// CONTEXT.md (`S e k k a C-j C-r S e k i C-j C-r I s h i C-j Enter K a
+    /// C-j Enter`). `Seki`/`Ishi` are `CaseBased` input, so the dictionary
+    /// group (rank 0 for uppercase, `group_rank`) outranks hiragana - typing
+    /// `Ishi` inside the nested step stages 石 (from the いし -> 石 entry),
+    /// not the hiragana いし.
+    #[test]
+    fn nested_registration_registers_the_inner_word_into_the_outer_word() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+        dict.add_entry("いし", "石");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+
+        assert!(
+            ctx.active_mut().begin_registration(),
+            "entering a second level of registration"
+        );
+        assert_eq!(ctx.registration_reading(), Some("せっか"));
+        assert_eq!(ctx.registration_prompt(), Some("せき 登録 ".to_string()));
+        assert_eq!(ctx.registration_word(), Some(String::new()));
+
+        for ch in "Ishi".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("石".to_string()));
+
+        assert!(ctx.finish_registration());
+        ctx.absorb_registration_output();
+        assert!(ctx.is_registering(), "the outer step should remain");
+        assert_eq!(ctx.registration_prompt(), Some("登録 ".to_string()));
+        assert_eq!(ctx.registration_word(), Some("石".to_string()));
+        assert!(ctx.poll_output().is_none());
+
+        for ch in "Ka".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("石火".to_string()));
+
+        assert!(ctx.finish_registration());
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.poll_output(), Some("石火".to_string()));
+        assert!(!ctx.is_registering());
+
+        let seki_entries = user_dict.lookup("せき").expect("lookup failed");
+        assert_eq!(seki_entries[0].word, "石", "{:?}", seki_entries);
+        let sekka_entries = user_dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(
+            sekka_entries.len(),
+            1,
+            "せっか should hold exactly one entry (石火): {:?}",
+            sekka_entries
+        );
+        assert_eq!(sekka_entries[0].word, "石火");
+        assert_eq!(sekka_entries[0].frequency, 1);
+    }
+
+    /// D-171/D-179: cancelling a nested registration step drops only that
+    /// step - the outer step's own state, frozen since its own Ctrl-R, is
+    /// left exactly as it was (`begin_registration`/`cancel_registration`
+    /// never touch it) - and a second cancel then drops the outer step the
+    /// same way, restoring the very first commit display.
+    #[test]
+    fn nested_cancel_returns_to_the_outer_step_before_ctrl_r() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "赤化");
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert_eq!(
+            ctx.registration_word(),
+            Some("石".to_string()),
+            "Seki is CaseBased input, so 石 (the dictionary candidate) outranks せき"
+        );
+
+        assert!(ctx.active_mut().begin_registration());
+
+        for ch in "Ishi".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.absorb_registration_output();
+
+        assert!(ctx.cancel_registration());
+        assert!(ctx.is_registering());
+        assert_eq!(ctx.registration_prompt(), Some("登録 ".to_string()));
+        assert_eq!(
+            ctx.registration_word(),
+            Some("石".to_string()),
+            "the outer step's own commit display from before its Ctrl-R must be untouched"
+        );
+        assert!(ctx.active().has_staged_candidate());
+
+        assert!(ctx.cancel_registration());
+        assert!(!ctx.is_registering());
+        assert_eq!(ctx.get_preedit(), "赤化");
+    }
+
+    /// D-171's display rule: the registration popup lists every **nested**
+    /// step's reading (not the outermost, which is shown separately via
+    /// `registration_reading`) from the outside in, and the word being
+    /// assembled is always the innermost step's own - an outer step's own
+    /// in-progress typing is never shown while a nested step is active.
+    #[test]
+    fn registration_prompt_lists_the_inner_readings_from_outer_to_inner() {
+        let mut ctx = SekkaContext::new();
+
+        for ch in "Kenkou".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Touki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        for ch in "Hakai".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        for ch in "Toukotsu".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        assert_eq!(ctx.registration_reading(), Some("けんこう"));
+        assert_eq!(
+            ctx.registration_prompt(),
+            Some("とうき はかい とうこつ 登録 ".to_string())
+        );
+        assert_eq!(ctx.registration_word(), Some(String::new()));
+
+        ctx.active_mut().process_key('T', false);
+        ctx.active_mut().process_key('o', false);
+        ctx.absorb_registration_output();
+        assert_eq!(
+            ctx.registration_word(),
+            Some("To".to_string()),
+            "an outer step's own in-progress typing is never shown"
+        );
+    }
+
+    /// REG-05 applied to a nested step: an Enter with nothing ever typed
+    /// into the innermost step is consumed but changes nothing - the
+    /// nested session stays exactly as it was, one level deep.
+    #[test]
+    fn nested_enter_with_an_empty_inner_word_changes_nothing() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        assert!(!ctx.finish_registration());
+        assert_eq!(ctx.registration_prompt(), Some("せき 登録 ".to_string()));
+    }
 }
