@@ -3940,6 +3940,41 @@ mod tests {
     }
 
     #[test]
+    fn commit_alt_passthrough_char_keeps_d12_learning_for_the_flushed_candidate() {
+        // D-185 / D-12: an Alt-held printable key in the candidate window confirms
+        // the selected candidate; the D-12 flush (`flush_last_commit`, the single
+        // exit of learning, run by `dispatch_input` before the Alt branch) records
+        // the selection and `commit_alt_passthrough_char` only appends the
+        // character, so the learned candidate leads the next conversion.
+        let mut master = MockDictionary::new();
+        master.add_entry("かんじ", "漢字");
+        master.add_entry("かんじ", "幹事");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        commit_then_reselect(&mut ctx, "Kanji");
+        ctx.next_candidate();
+        ctx.confirm();
+        assert!(ctx.flush_last_commit());
+        ctx.commit_alt_passthrough_char('d');
+        assert_eq!(ctx.poll_output(), Some("幹事d".to_string()));
+        assert!(ctx.poll_output().is_none());
+
+        let recommitted = commit_then_reselect(&mut ctx, "Kanji");
+        assert_eq!(
+            recommitted, "幹事",
+            "the candidate confirmed through the Alt path should have been learned"
+        );
+    }
+
+    #[test]
     fn entering_reselection_causes_no_commit() {
         let mut ctx = SekkaContext::new();
         ctx.process_key('k', false);

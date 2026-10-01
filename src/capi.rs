@@ -97,6 +97,10 @@ fn is_romaji_char(keysym: u32) -> bool {
 /// this range, so they keep the commit-and-forward behavior of D-03 (D-162).
 /// Non-ASCII printable keysyms (e.g. Latin-1 Supplement) are out of scope for
 /// D-158 (RESEARCH Open Question 1).
+///
+/// D-185 (Phase 11): the same range decides which Alt-held keys are committed as
+/// text with Alt removed, so Latin-1 and the like stay out of range there too
+/// (D-187 keeps them on the D-03/D-162 path).
 fn is_printable_ascii(keysym: u32) -> bool {
     (0x20..=0x7E).contains(&keysym)
 }
@@ -274,6 +278,16 @@ fn is_selecting_table_key(keysym: u32, modifiers: u32) -> bool {
 /// consumed here and changes nothing else. Outside the commit display state
 /// (nothing staged, or still typing romaji) Ctrl-R falls through unchanged and
 /// keeps D-03's plain Ctrl+letter handling.
+///
+/// D-185 (Phase 11): a printable ASCII key held with Alt (but neither Ctrl nor
+/// Super) is committed as that character with Alt removed, appended to whatever
+/// this key event commits (the romaji buffer, or the word the D-12 flush above
+/// produced) or alone when there is nothing, in a single CommitString. Unlike
+/// D-158 it is consumed even when empty, and it is never forwarded (D-155). D-186:
+/// Shift is already reflected in the keysym, so Alt+Shift+d arrives as `D`.
+/// D-187/D-188: an Alt key that is not a printable character, and any key with
+/// Ctrl or Super (with or without Alt), stay on the D-03/D-162 commit-and-forward
+/// path.
 fn dispatch_input(
     ctx: &mut SekkaContext,
     forward_key: &mut bool,
@@ -338,8 +352,11 @@ fn dispatch_input(
         return 1;
     }
 
-    // Anything else (non-character keys, including keys with Ctrl/Alt/Super):
-    // commit the romaji as it is and forward the key too (D-03). Since D-158
+    // Anything else (non-character keys, including keys with Ctrl/Alt/Super).
+    // Since Phase 11 (D-185), what reaches here is only a non-character key (with
+    // or without Alt, D-187) or a key with Ctrl or Super (whether or not Alt is
+    // also held, D-188); an Alt-only printable key was committed above.
+    // Earlier description: commit the romaji as it is and forward the key too (D-03). Since D-158
     // (Phase 9), the only keys that reach this branch are non-printable keys and
     // Ctrl/Super-modified keys, plus Alt-modified non-printable keys (D-166:
     // history kept, not erased; D-185 moved Alt-only printable keys above).
@@ -375,7 +392,9 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
         // reprocess the same key as the Input state (with an empty buffer). A
         // character key starts new romaji input; a printable key is appended
         // to the confirmed candidate (D-158); a non-printable key is
-        // forwarded (D-03/D-162).
+        // forwarded (D-03/D-162). An Alt-only printable key is never matched
+        // against D-09's table, so it too lands here: the confirmed candidate gets
+        // the character appended without Alt (D-185).
         ctx.confirm();
         let result = dispatch_input(ctx, forward_key, keysym, modifiers);
         if result == 0 {
@@ -2785,6 +2804,96 @@ mod tests {
             let preedit = sekka_context_get_preedit(ctx);
             assert_eq!(CStr::from_ptr(preedit).to_str().unwrap(), "");
             sekka_free_string(preedit);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn alt_printable_keys_in_selection_mode_confirm_the_selected_candidate_and_are_appended() {
+        // D-185 (table row 4) with D-09's table keys: in the candidate window an
+        // Alt-held key is never matched against D-09's table (`handle_selecting_key`
+        // returns false for Alt, even for Space, `n`, `q` and `j`), so `route_key`
+        // confirms the selected candidate and `dispatch_input` appends the
+        // character without Alt. One CommitString, no forward, window closed.
+        for (keysym, ch) in [
+            (b'd' as u32, "d"),
+            (0x20u32, " "),
+            (b'n' as u32, "n"),
+            (b'q' as u32, "q"),
+            (b'j' as u32, "j"),
+        ] {
+            unsafe {
+                let ctx = sekka_context_new();
+                reselection_is_entered_for_ka_without_a_dictionary(ctx);
+                // Advance to the next candidate (カ) first.
+                sekka_context_process_key_event(ctx, b'j' as u32, 0x4, 0);
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    format!("カ{}", ch),
+                    "keysym={:#x}",
+                    keysym
+                );
+                sekka_free_string(output);
+
+                assert!(
+                    sekka_context_poll_output(ctx).is_null(),
+                    "a single commit only (keysym={:#x})",
+                    keysym
+                );
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert_eq!(
+                    sekka_context_get_candidate_count(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert_eq!(preedit_string(ctx), "", "keysym={:#x}", keysym);
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn an_alt_printable_key_in_the_commit_display_state_is_appended_to_the_word() {
+        // D-185 (table row 3): in the commit display state the D-12 flush commits
+        // the staged word and the Alt branch appends the character without Alt, in
+        // a single CommitString; nothing is forwarded (D-155) and the staged word is
+        // gone afterwards.
+        unsafe {
+            let ctx = make_commit_display_state();
+
+            let consumed = sekka_context_process_key_event(ctx, b'd' as u32, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "かd");
+            sekka_free_string(output);
+
+            assert!(
+                sekka_context_poll_output(ctx).is_null(),
+                "a single commit only"
+            );
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
+            assert_eq!(
+                sekka_context_trigger(ctx),
+                0,
+                "the staged word was consumed, so there is nothing left to reselect"
+            );
 
             sekka_context_free(ctx);
         }
