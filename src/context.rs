@@ -803,6 +803,29 @@ impl SekkaContext {
         self.preedit.clear();
     }
 
+    /// Commits what the application shows before an explicit reset or an
+    /// input method switch (D-15 / D-181)
+    ///
+    /// `SekkaState::reset(true)` calls this instead of `finalize_staged`'s
+    /// former dual role (fcitx5-sekka's own C++ wiring). During word
+    /// registration, the application's input position shows only the
+    /// outermost step's reading (D-170), so exactly that is committed and
+    /// every step - nested or not - is discarded: the word being assembled
+    /// and the candidate staged before Ctrl-R are neither committed nor
+    /// registered, and nothing is learned. Outside registration this is
+    /// `finalize_staged` unchanged (D-15). A real focus loss (D-14/D-180)
+    /// never calls this - `reset()` runs instead, which discards the
+    /// registration session the same way but commits nothing at all.
+    pub fn finalize_for_reset(&mut self) {
+        match self.registration.take() {
+            Some(session) => {
+                self.discard_staged();
+                self.committed_output = Some(session.reading);
+            }
+            None => self.finalize_staged(),
+        }
+    }
+
     /// Pulls whatever the active registration step just committed up into
     /// this context's `draft` (REG-02)
     ///
@@ -1074,9 +1097,11 @@ impl SekkaContext {
     /// Commits whatever is currently on screen, right now (D-15)
     ///
     /// In the Selecting state it moves the selected candidate into the commit display
-    /// state and then flushes; in the commit display state it flushes as it is. The C++
-    /// side uses it to "commit what is on screen" on a focus change, an input method
-    /// switch or an explicit reset.
+    /// state and then flushes; in the commit display state it flushes as it is. As of
+    /// D-181 (Phase 10), the C++ side's reset / input-method-switch path goes through
+    /// `finalize_for_reset` instead of this function; `finalize_staged` is now used to
+    /// commit the (possibly nested) active step during registration and by a candidate
+    /// click (D-116).
     pub fn finalize_staged(&mut self) {
         self.confirm();
         self.flush_last_commit();
@@ -5409,5 +5434,221 @@ mod tests {
 
         assert!(!ctx.finish_registration());
         assert_eq!(ctx.registration_prompt(), Some("せき 登録 ".to_string()));
+    }
+
+    // === D-181 / D-180: `finalize_for_reset` (Phase 10, 10-04) ===
+
+    /// D-181: an explicit reset commits only the outermost step's reading -
+    /// not the word being assembled and not the candidate staged before
+    /// Ctrl-R - and ends registration entirely. The candidate staged right
+    /// before Ctrl-R (石, from typing further into the inner step after
+    /// `Seki` was staged) is committed and learned through the ordinary D-12
+    /// flush that happens the moment a further character is typed (D-34,
+    /// unrelated to and unaffected by `finalize_for_reset`); what
+    /// `finalize_for_reset` itself must guarantee is that the reading being
+    /// registered (せっか) never gets an entry of its own, since
+    /// `finish_registration` (and its D-182 `record_registration`) is never
+    /// reached.
+    #[test]
+    fn finalize_for_reset_commits_only_the_outermost_reading() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+
+        for ch in "Ka".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("石Ka".to_string()));
+
+        ctx.finalize_for_reset();
+
+        assert_eq!(ctx.poll_output(), Some("せっか".to_string()));
+        assert!(!ctx.is_registering());
+        assert_eq!(ctx.get_preedit(), "");
+        assert!(!ctx.has_staged_candidate());
+        assert_eq!(ctx.state(), ConversionState::Input);
+
+        assert_eq!(
+            user_dict.lookup("せき").expect("lookup failed"),
+            vec![DictEntry::new("石").with_frequency(1)],
+            "the intermediate candidate is learned by the ordinary D-12 flush that fired \
+             when 'K' was typed - unrelated to finalize_for_reset"
+        );
+        assert!(
+            user_dict
+                .lookup("せっか")
+                .expect("lookup failed")
+                .is_empty(),
+            "the reading being registered must never get an entry - finish_registration \
+             (and its D-182 write) is never reached"
+        );
+    }
+
+    /// D-181 / 10-RESEARCH.md Assumptions Log A3: with a nested registration
+    /// in progress, an explicit reset still commits only the very outermost
+    /// step's reading - it does not walk down to the nested step's own
+    /// reading.
+    #[test]
+    fn finalize_for_reset_with_nested_registration_commits_the_outermost_reading() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        for ch in "Ishi".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.absorb_registration_output();
+
+        ctx.finalize_for_reset();
+
+        assert_eq!(ctx.poll_output(), Some("せっか".to_string()));
+        assert!(!ctx.is_registering());
+    }
+
+    /// D-15: outside registration, `finalize_for_reset` behaves exactly like
+    /// `finalize_staged` - (a) committing and learning the word shown in the
+    /// commit display state, and (b) committing the candidate selected
+    /// during reselection.
+    #[test]
+    fn finalize_for_reset_outside_registration_matches_finalize_staged() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+
+        ctx.finalize_for_reset();
+
+        assert_eq!(ctx.poll_output(), Some("赤化".to_string()));
+        assert_eq!(
+            user_dict.lookup("せっか").expect("lookup failed"),
+            vec![DictEntry::new("赤化").with_frequency(1)],
+            "outside registration, finalize_for_reset must still learn (D-15 unchanged)"
+        );
+
+        let mut dict2 = MockDictionary::new();
+        dict2.add_entry("せき", "石");
+        dict2.add_entry("せき", "席");
+        let mut ctx2 = SekkaContext::new();
+        ctx2.add_dictionary(Arc::new(dict2));
+
+        commit_then_reselect(&mut ctx2, "Seki");
+        ctx2.next_candidate();
+        assert_eq!(ctx2.get_preedit(), "席");
+
+        ctx2.finalize_for_reset();
+
+        assert_eq!(ctx2.poll_output(), Some("席".to_string()));
+    }
+
+    /// D-180 / REG-10: `reset()` (a real focus loss) drops the whole nested
+    /// registration session and releases every dictionary `Arc` its inner
+    /// steps were holding - `Arc::strong_count` returns to what it was
+    /// before registration began, and the same user dictionary path can be
+    /// reopened. Afterward the context keeps working normally.
+    #[test]
+    fn reset_clears_nested_registration_and_releases_dictionary_handles() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        let master: Arc<dyn Dictionary> = Arc::new(dict);
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict: Arc<dyn Dictionary> = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![master, user_dict.clone()]);
+        // The count right after an ordinary (non-registering) set_dictionaries -
+        // the local variable plus this context's own clone - is what `reset()`
+        // must return to once the nested registration below is torn down.
+        let normal_count = Arc::strong_count(&user_dict);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert!(ctx.active_mut().begin_registration());
+
+        assert!(
+            Arc::strong_count(&user_dict) > normal_count,
+            "each of the two nested inner steps clones the dictionary Arc"
+        );
+
+        ctx.reset();
+
+        assert_eq!(
+            Arc::strong_count(&user_dict),
+            normal_count,
+            "reset() must release every dictionary Arc the nested steps were holding"
+        );
+        assert!(!ctx.is_registering());
+        assert!(ctx.poll_output().is_none());
+        assert_eq!(ctx.get_preedit(), "");
+
+        // The context keeps working normally afterward.
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "赤化");
     }
 }

@@ -1234,6 +1234,36 @@ pub unsafe extern "C" fn sekka_context_get_candidate_index(ctx: *mut SekkaContex
 // Word registration (Phase 10)
 // ---------------------------------------------------------------------------
 
+/// Commits what the application shows before an explicit reset or an input
+/// method switch (D-15 / D-181)
+///
+/// `SekkaState::reset(true)` calls this instead of `sekka_context_confirm_candidate`
+/// (fcitx5-sekka's own C++ wiring, Task 2 of this plan). `sekka_context_confirm_candidate`
+/// keeps its role as the click path of the candidate window (D-116). During word
+/// registration, `finalize_for_reset` commits only the outermost step's reading -
+/// the application's input position never shows more than that (D-170) - and
+/// discards every registration step, nested or not: the word being assembled and
+/// the candidate staged before Ctrl-R are neither committed nor registered.
+/// Outside registration this is identical to `sekka_context_confirm_candidate`
+/// (`finalize_staged`, D-15 unchanged). A real focus loss (D-14/D-180) never calls
+/// this - only `sekka_context_reset` runs, which discards the registration session
+/// the same way but commits nothing at all.
+///
+/// Passing a NULL pointer does nothing.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_finalize_for_reset(ctx: *mut SekkaContextFfi) {
+    if ctx.is_null() {
+        return;
+    }
+    let _ = catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &mut *ctx };
+        ctx.ctx.finalize_for_reset();
+    }));
+}
+
 /// Returns whether word registration is active (D-170)
 ///
 /// Returns 0 (not registering) for a NULL pointer or on panic.
@@ -4849,6 +4879,152 @@ mod tests {
             assert_eq!(reg_prompt_string(ctx), "登録 ");
             assert!(sekka_context_poll_output(ctx).is_null());
             assert_eq!(sekka_context_is_registering(ctx), 1);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    // === D-15 / D-180 / D-181: `finalize_for_reset` through the C ABI (Phase 10, 10-04) ===
+
+    /// D-181: an explicit reset commits only the outermost step's typed
+    /// reading (D-168) - not the candidate that was selected when Ctrl-R was
+    /// pressed ("セッカ") and not the word being assembled ("Ki") - and ends
+    /// registration entirely. A NULL pointer does not crash.
+    #[test]
+    fn finalize_for_reset_commits_the_reading_and_ends_registration() {
+        unsafe {
+            sekka_context_finalize_for_reset(ptr::null_mut());
+
+            let ctx = sekka_context_new();
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            // Ctrl-J stages the first candidate (せっか, no dictionary set).
+            sekka_context_trigger(ctx);
+            // A second Ctrl-J enters reselection.
+            sekka_context_trigger(ctx);
+            // A third Ctrl-J (an explicit next-candidate key in the Selecting
+            // state) moves to the second candidate (セッカ).
+            let next = sekka_context_trigger(ctx);
+            assert_eq!(next, 1);
+            assert_eq!(preedit_string(ctx), "セッカ");
+
+            // Enter only moves the selection into the commit display state -
+            // nothing is sent to the application yet (revised D-08).
+            let confirmed = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(confirmed, 1);
+            assert!(sekka_context_poll_output(ctx).is_null());
+            assert_eq!(preedit_string(ctx), "セッカ");
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(
+                reg_reading_string(ctx),
+                "せっか",
+                "the typed reading (D-168), not the selected candidate's display"
+            );
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+
+            sekka_context_finalize_for_reset(ctx);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "せっか");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-180: a real focus loss (`sekka_context_reset`) during registration
+    /// commits nothing at all - not even the outermost step's reading - and
+    /// ends registration.
+    #[test]
+    fn reset_during_registration_commits_nothing() {
+        unsafe {
+            let ctx = make_commit_display_state();
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+
+            sekka_context_reset(ctx);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// REG-10: `reset()` (via `reloadDictionaries`' own
+    /// `sekka_context_set_dictionaries` path) releases every dictionary Arc a
+    /// nested registration step was holding, so the same user dictionary
+    /// path can be reopened - it stays locked as long as the context or its
+    /// inner registration step still holds it.
+    #[test]
+    fn set_dictionaries_during_registration_drops_the_inner_steps() {
+        unsafe {
+            let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+            let dict_path = tmp.path().join("registration_user_dict");
+            let path_cstr =
+                CString::new(dict_path.to_str().unwrap()).expect("failed to build the CString");
+            let mut dict = sekka_user_dict_new(path_cstr.as_ptr(), ptr::null());
+            assert!(!dict.is_null());
+
+            let ctx = sekka_context_new();
+            sekka_context_set_dictionaries(ctx, &mut dict, 1);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+
+            // The inner registration step converts its own input, inheriting
+            // an Arc clone of the same dictionary list (begin_registration).
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+
+            // Releases only the caller's own handle - the context and its
+            // inner registration step still hold their own Arc clones.
+            sekka_free_dictionary(dict);
+
+            // Contrast: the same path is still locked by sled (this test has
+            // teeth - if this is NOT NULL, the premise above no longer
+            // holds; stop and report rather than continuing on a false
+            // assumption).
+            let still_locked = sekka_user_dict_new(path_cstr.as_ptr(), ptr::null());
+            assert!(
+                still_locked.is_null(),
+                "the context and its inner registration step should still hold the dictionary Arc"
+            );
+
+            // reloadDictionaries' own path: reset() drops the nested
+            // registration session (and its Arc clone), then the empty
+            // dictionary list replaces the context's own clone.
+            sekka_context_set_dictionaries(ctx, ptr::null_mut(), 0);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            let reopened = sekka_user_dict_new(path_cstr.as_ptr(), ptr::null());
+            assert!(
+                !reopened.is_null(),
+                "every dictionary Arc should have been released by now"
+            );
+            sekka_free_dictionary(reopened);
 
             sekka_context_free(ctx);
         }
