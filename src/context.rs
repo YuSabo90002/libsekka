@@ -4706,4 +4706,199 @@ mod tests {
         assert!(!ctx.is_registering());
         assert_eq!(ctx.get_preedit(), "");
     }
+
+    /// Types `outer`, converts it with Ctrl-J, presses Ctrl-R, then types each
+    /// string of `inner_steps` into the innermost step and (except the last,
+    /// when `convert_last_step` is false - the D-176 raw-romaji path) converts
+    /// it with Ctrl-J too, calling `absorb_registration_output` after every key
+    /// - exactly the sequence capi drives, one absorb per key event. Finally
+    /// calls `finish_registration` and returns `poll_output()`.
+    fn register_word(
+        ctx: &mut SekkaContext,
+        outer: &str,
+        inner_steps: &[&str],
+        convert_last_step: bool,
+    ) -> Option<String> {
+        for ch in outer.chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(
+            ctx.begin_registration(),
+            "begin_registration should succeed with a staged candidate"
+        );
+
+        let last_index = inner_steps.len().saturating_sub(1);
+        for (i, step) in inner_steps.iter().enumerate() {
+            for ch in step.chars() {
+                ctx.active_mut().process_key(ch, false);
+                ctx.absorb_registration_output();
+            }
+            if !step.is_empty() && (i != last_index || convert_last_step) {
+                ctx.active_mut().process_key('\0', true);
+                ctx.absorb_registration_output();
+            }
+        }
+
+        ctx.finish_registration();
+        ctx.poll_output()
+    }
+
+    /// REG-07 / D-182: a word registered under a reading takes over the head
+    /// of that reading's user-dictionary entries even when another word was
+    /// already learned there (frequency = the existing maximum + 1).
+    #[test]
+    fn finish_registration_puts_the_word_first_even_over_a_learned_word() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        // Learn 赤化 twice through ordinary flush (D-34).
+        for _ in 0..2 {
+            for ch in "Sekka".chars() {
+                ctx.process_key(ch, false);
+            }
+            ctx.process_key('\0', true);
+            ctx.flush_last_commit();
+            ctx.poll_output();
+        }
+
+        let word = register_word(&mut ctx, "Sekka", &["Seki", "Ka"], true);
+        assert_eq!(word, Some("石火".to_string()));
+
+        let entries = user_dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 2, "{:?}", entries);
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[0].frequency, 3);
+        assert_eq!(entries[1].word, "赤化");
+        assert_eq!(entries[1].frequency, 2);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "石火");
+    }
+
+    /// D-183: registration does not change D-07's group order (kana readings
+    /// before dictionary words) - an all-lowercase query still lists the four
+    /// D-07 kana/alphabet candidates first, with the dictionary word group
+    /// (headed by the just-registered word) starting right after.
+    #[test]
+    fn finish_registration_heads_the_dictionary_group_for_lowercase_input() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for _ in 0..2 {
+            for ch in "Sekka".chars() {
+                ctx.process_key(ch, false);
+            }
+            ctx.process_key('\0', true);
+            ctx.flush_last_commit();
+            ctx.poll_output();
+        }
+        let word = register_word(&mut ctx, "Sekka", &["Seki", "Ka"], true);
+        assert_eq!(word, Some("石火".to_string()));
+
+        commit_then_reselect(&mut ctx, "sekka");
+        let candidates = ctx.get_candidates();
+        let display: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(
+            &display[0..4],
+            &["せっか", "セッカ", "ｓｅｋｋａ", "sekka"],
+            "実測: {:?}",
+            display
+        );
+        let ishibi_pos = display
+            .iter()
+            .position(|d| *d == "石火")
+            .expect("石火 should be a candidate");
+        assert_eq!(ishibi_pos, 4, "実測: {:?}", display);
+        let akabi_pos = display
+            .iter()
+            .position(|d| *d == "赤化")
+            .expect("赤化 should be a candidate");
+        assert!(
+            akabi_pos > ishibi_pos,
+            "赤化 should sit behind 石火: {:?}",
+            display
+        );
+    }
+
+    /// D-179 / D-181's prerequisite: the candidate that was staged in the
+    /// commit display state right before Ctrl-R is neither committed nor
+    /// learned once registration finishes.
+    #[test]
+    fn finish_registration_records_nothing_for_the_candidate_staged_before_ctrl_r() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        let word = register_word(&mut ctx, "Sekka", &["Seki", "Ka"], true);
+        assert_eq!(word, Some("石火".to_string()));
+
+        let entries = user_dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(
+            entries,
+            vec![DictEntry::new("石火").with_frequency(1)],
+            "赤化 (the candidate staged before Ctrl-R) must not appear: {:?}",
+            entries
+        );
+    }
+
+    /// REG-08: a word registered under a reading is found through the same
+    /// fuzzy search (SymSpell) that finds any other user-dictionary entry -
+    /// in the same process, with no restart in between.
+    #[test]
+    fn registration_fuzzy_search_finds_the_registered_word_from_a_typo() {
+        let dict = MockDictionary::new();
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        // D-176: the inner step is left as unconverted romaji (no trailing
+        // Ctrl-J), exercising commit_raw_romaji's "commit as-is" path.
+        let word = register_word(&mut ctx, "Rinakkusu", &["Linux"], false);
+        assert_eq!(word, Some("Linux".to_string()));
+
+        commit_then_reselect(&mut ctx, "Rinakusu");
+        let candidates = ctx.get_candidates();
+        assert!(
+            candidates.iter().any(|c| c.display == "Linux"),
+            "実測: {:?}",
+            candidates.iter().map(|c| &c.display).collect::<Vec<_>>()
+        );
+    }
 }

@@ -703,4 +703,152 @@ mod tests {
             "a key holding a broken value should keep its original bytes rather than be deleted"
         );
     }
+
+    // === D-182: record_registration (Phase 10, word registration) ===
+
+    #[test]
+    fn record_registration_sets_the_frequency_one_above_the_readings_maximum() {
+        let (dict, _tmp) = create_test_dict();
+
+        for _ in 0..3 {
+            dict.record_selection("せっか", "赤化")
+                .expect("failed to record the selection");
+        }
+        dict.record_registration("せっか", "石火")
+            .expect("failed to record the registration");
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[0].frequency, 4);
+        assert_eq!(entries[1].word, "赤化");
+        assert_eq!(entries[1].frequency, 3);
+    }
+
+    #[test]
+    fn record_registration_starts_a_new_reading_at_one() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.record_registration("せっか", "石火")
+            .expect("failed to record the registration");
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[0].frequency, 1);
+    }
+
+    #[test]
+    fn record_registration_dedup_keeps_a_single_entry_for_the_same_pair() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.record_registration("せっか", "石火")
+            .expect("the first registration failed");
+        dict.record_registration("せっか", "石火")
+            .expect("the second (re-)registration failed");
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(
+            entries.len(),
+            1,
+            "re-registering the same (reading, word) pair must not duplicate it: {:?}",
+            entries
+        );
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[0].frequency, 2);
+
+        for _ in 0..5 {
+            dict.record_selection("せっか", "赤化")
+                .expect("failed to record the selection");
+        }
+        dict.record_registration("せっか", "石火")
+            .expect("the third registration failed");
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[0].frequency, 6);
+        assert_eq!(entries[1].word, "赤化");
+        assert_eq!(entries[1].frequency, 5);
+    }
+
+    #[test]
+    fn record_registration_adds_the_reading_to_the_roman_and_symspell_indexes() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.record_registration("りなっくす", "Linux")
+            .expect("failed to record the registration");
+
+        let roman_bucket = dict.roman_bucket("rin").expect("roman_bucket failed");
+        assert!(
+            roman_bucket.iter().any(|rk| rk.reading == "りなっくす"),
+            "りなっくす should be in roman_bucket right after record_registration: {:?}",
+            roman_bucket
+        );
+
+        // Deleting one character from "りなっくす" gives "りなくす" (「っ」 removed).
+        let symspell_bucket = dict
+            .symspell_bucket("りなくす")
+            .expect("symspell_bucket failed");
+        assert!(
+            symspell_bucket.contains(&"りなっくす".to_string()),
+            "りなっくす should be in symspell_bucket right after record_registration: {:?}",
+            symspell_bucket
+        );
+    }
+
+    #[test]
+    fn record_registration_lands_on_exactly_800_with_8_threads_of_100() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let dict_path = tmp.path().join("test_user_dict");
+        let dict = std::sync::Arc::new(
+            UserDict::open(&dict_path).expect("failed to open the user dictionary"),
+        );
+
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let dict = std::sync::Arc::clone(&dict);
+            handles.push(std::thread::spawn(move || {
+                for _ in 0..100 {
+                    dict.record_registration("せっか", "石火")
+                        .expect("failed to record the registration");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("failed to join a thread");
+        }
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(
+            entries[0].frequency, 800,
+            "8 threads x 100 re-registrations of the same pair should land on \
+             exactly 800 (every write is \"max + 1\" including itself, so with \
+             no lost updates the count still lands on the thread x iteration total)"
+        );
+    }
+
+    #[test]
+    fn record_registration_returns_an_error_without_deleting_a_key_holding_a_broken_value() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.db
+            .insert("せっか".as_bytes(), b"not json".to_vec())
+            .expect("the direct write failed");
+
+        let result = dict.record_registration("せっか", "石火");
+        assert!(result.is_err(), "a broken value should yield Err");
+
+        let raw = dict
+            .db
+            .get("せっか".as_bytes())
+            .expect("failed to access the db")
+            .expect("the key was deleted");
+        assert_eq!(
+            raw.as_ref(),
+            b"not json",
+            "a key holding a broken value should keep its original bytes rather than be deleted"
+        );
+    }
 }
