@@ -262,6 +262,16 @@ struct LastCommit {
     /// a word confirmed during reselection reverts to the same original romaji
     /// as the word it replaced.
     raw_romaji: String,
+    /// The kana of the romaji the user typed, before conversion (D-168, Phase
+    /// 10). Not `Candidate.reading` (the dictionary headword) - the reading a
+    /// user-word registration records is what the user actually typed, even
+    /// when the staged candidate came from a dictionary entry filed under a
+    /// different headword (SymSpell fuzzy match). Non-empty only for
+    /// okuri-nashi `CaseBased` / `HiraganaConvertible` input; empty for
+    /// okuri-ari, `NumberOnly`, `NumberPrefixed` and `Symbol` input (D-169
+    /// refuses registration on those, in a later plan). `confirm` carries this
+    /// value over exactly like `raw_romaji`.
+    reading: String,
 }
 
 /// Japanese input context
@@ -286,6 +296,46 @@ pub struct SekkaContext {
     committed_output: Option<String>,
     /// Cache of what was just committed (for reselection; invalidated by any other key input or by a reset, per D-06).
     last_commit: Option<LastCommit>,
+    /// The active word-registration session, if any (D-170/D-171/D-172,
+    /// Phase 10). Some the whole time a user is in the registration mode
+    /// entered by Ctrl-R; while Some, this context's own `last_commit`,
+    /// `state`, `candidates`, `candidate_index` and `preedit` are frozen at
+    /// the moment Ctrl-R was pressed and restored as-is by cancellation (a
+    /// later plan). `Box` keeps `SekkaContext` from being infinitely sized by
+    /// its own recursive field (`RegistrationSession.inner` is itself a
+    /// `SekkaContext`, D-171).
+    registration: Option<Box<RegistrationSession>>,
+}
+
+/// The label shown in the popup while registering a word (D-170). The
+/// trailing character is a half-width space, matching the plan's
+/// `registration_prompt()` layout (each reading segment already ends in a
+/// half-width space, so the label reads naturally right after it).
+const REGISTRATION_LABEL: &str = "登録 ";
+
+/// One step of word registration (D-170/D-171/D-172, ARCHITECTURE case C)
+///
+/// A `RegistrationSession` is created by `begin_registration` and consumed by
+/// `finish_registration`. `inner` is a plain `SekkaContext` used exactly like
+/// an ordinary input context - romaji input and Ctrl-J conversion work inside
+/// it unmodified - and because `inner.registration` can itself become `Some`,
+/// this struct alone represents D-171's unbounded recursion (entering
+/// registration again from inside a registration session nests another
+/// `RegistrationSession` inside `inner`).
+struct RegistrationSession {
+    /// The reading being registered (D-168): a copy of `last_commit.reading`
+    /// at the moment Ctrl-R was pressed. Never changes for the lifetime of
+    /// this step.
+    reading: String,
+    /// This step's own input context. Everything the user types while this
+    /// step is the innermost one goes through `inner` exactly like ordinary
+    /// input; its commits never reach `committed_output` directly (they are
+    /// absorbed into `draft` by `absorb_registration_output`, REG-02).
+    inner: SekkaContext,
+    /// The word being assembled, standing in for "the application" while
+    /// registering (D-175). Whatever `inner` commits is appended to the end
+    /// of this string.
+    draft: String,
 }
 
 impl Default for SekkaContext {
@@ -306,6 +356,7 @@ impl SekkaContext {
             dictionaries: Vec::new(),
             committed_output: None,
             last_commit: None,
+            registration: None,
         }
     }
 
@@ -495,7 +546,21 @@ impl SekkaContext {
     /// dictionaries to the front, D-39). A recording failure (a sled error, a read-only
     /// filesystem and so on) never blocks the commit (D-35; neither `?` propagation nor
     /// panic unwinding happens).
+    ///
+    /// Defensive guard (Phase 10, Claude's Discretion): while `self.registration`
+    /// is `Some`, this context's own `last_commit` is frozen (the candidate that
+    /// was staged right before Ctrl-R, D-179/D-181) and must not be committed or
+    /// learned through this path. Word registration writes through
+    /// `finish_registration` -> `Dictionary::record_registration` instead (D-182),
+    /// never through here - this keeps D-34/D-37's single learning exit intact.
+    /// The capi dispatch routes registration-mode keys to `active_mut()`, so this
+    /// context's own `flush_last_commit` should never be reachable while
+    /// registering; this guard is a defense in depth in case that routing is ever
+    /// wrong.
     pub fn flush_last_commit(&mut self) -> bool {
+        if self.registration.is_some() {
+            return false;
+        }
         if let Some(last) = self.last_commit.take() {
             if let Some(candidate) = last.candidates.get(last.index) {
                 if let Some((reading, word)) = &candidate.learn_pair {
@@ -526,11 +591,237 @@ impl SekkaContext {
         self.committed_output = None;
         // D-06: a focus change, an input method switch or a reset invalidates the last commit.
         self.last_commit = None;
+        // The whole nested registration session (and any dictionary Arcs it
+        // holds) is dropped here, laying the groundwork for D-180 (a later
+        // plan handles what happens to a registration session on focus loss).
+        self.registration = None;
     }
 
     /// Returns the current conversion state
     pub fn state(&self) -> ConversionState {
         self.state
+    }
+
+    // === Word registration (D-167/D-170/D-171/D-172/D-182, Phase 10) ===
+
+    /// Returns whether a word-registration session is active (Ctrl-R was
+    /// pressed and no Enter has finished it yet)
+    pub fn is_registering(&self) -> bool {
+        self.registration.is_some()
+    }
+
+    /// Returns whether there is a staged candidate to register (D-169's
+    /// minimal shape check - Ctrl-R only enters registration in the commit
+    /// display state; a finer-grained shape check is a later plan's job)
+    pub fn has_staged_candidate(&self) -> bool {
+        self.last_commit.is_some()
+    }
+
+    /// Enters word registration (Ctrl-R in the commit display state, D-167)
+    ///
+    /// Does nothing to this context's own `last_commit` and the rest of its
+    /// state (frozen, D-170) - only `registration` becomes `Some`, wrapping a
+    /// brand new `SekkaContext` that shares this context's dictionary list
+    /// (an `Arc` clone, same order). Refuses (returns `false`, no-op) when
+    /// there is no staged candidate or its typed reading is empty (D-169's
+    /// minimal check; a finer-grained shape check belongs to a later plan).
+    ///
+    /// # Returns
+    /// true when a registration session was started, false when refused
+    pub fn begin_registration(&mut self) -> bool {
+        debug_assert!(!self.is_registering());
+        let Some(last) = self.last_commit.as_ref() else {
+            return false;
+        };
+        if last.reading.is_empty() {
+            return false;
+        }
+
+        let mut inner = SekkaContext::new();
+        inner.dictionaries = self.dictionaries.clone();
+
+        self.registration = Some(Box::new(RegistrationSession {
+            reading: last.reading.clone(),
+            inner,
+            draft: String::new(),
+        }));
+        true
+    }
+
+    /// Returns the input context that keys, the trigger and candidate
+    /// queries should be routed to
+    ///
+    /// While registering, this recurses to the innermost session's `inner`
+    /// (which is itself never registering, since only the innermost step's
+    /// `inner` stays a plain, non-registering context - D-171). Outside
+    /// registration, returns `self`.
+    pub fn active(&self) -> &SekkaContext {
+        if let Some(session) = &self.registration {
+            session.inner.active()
+        } else {
+            self
+        }
+    }
+
+    /// The mutable counterpart of `active` (see its documentation)
+    ///
+    /// Checked with `is_some()` first (an immutable borrow) so the recursive
+    /// call below can take a fresh mutable borrow of `session.inner` - NLL
+    /// accepts this shape where borrowing `self.registration` as `&mut`
+    /// directly inside the `if let` would not.
+    pub fn active_mut(&mut self) -> &mut SekkaContext {
+        if self.registration.is_some() {
+            self.registration.as_mut().unwrap().inner.active_mut()
+        } else {
+            self
+        }
+    }
+
+    /// Finishes word registration (Enter, D-172/D-176)
+    ///
+    /// Not registering: no-op, returns false. Otherwise: if this step's own
+    /// `inner` is itself still registering, delegates to its
+    /// `finish_registration` (only the innermost step ever actually finishes
+    /// first, D-171). When this step *is* the innermost: confirms whatever
+    /// `inner` currently shows (the selected candidate during reselection,
+    /// D-172), commits it (or the raw romaji as-is when nothing was staged,
+    /// D-176), appends whatever came out to `draft`. An empty `draft` after
+    /// that (REG-05 - nothing was ever typed) leaves the session in place and
+    /// returns false, so an empty Enter does not silently exit registration.
+    /// Otherwise this step is consumed: the reading/word pair is recorded
+    /// into the first `ReadWrite` dictionary (D-182), that dictionary is
+    /// asked to `save()` immediately (Claude's Discretion - persist a
+    /// registration right away rather than waiting for an explicit save
+    /// request), this context's own frozen candidate is discarded without
+    /// being committed or learned (`discard_staged`), and the registered word
+    /// becomes this context's committed output (D-172: only the outermost
+    /// step's Enter ever reaches the application, because only the outermost
+    /// step calls `poll_output`/its `committed_output` is what capi reads).
+    /// Both the `record_registration` and the `save` failure are ignored
+    /// (D-35: a recording failure never blocks the commit, the same
+    /// discipline as `flush_last_commit`).
+    ///
+    /// # Returns
+    /// true when a step finished (an Enter was consumed), false when there
+    /// was nothing to register (REG-05) or nothing was registering at all
+    pub fn finish_registration(&mut self) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+
+        if session.inner.is_registering() {
+            return session.inner.finish_registration();
+        }
+
+        session.inner.confirm();
+        session.inner.commit_raw_romaji();
+        if let Some(text) = session.inner.poll_output() {
+            session.draft.push_str(&text);
+        }
+
+        if session.draft.is_empty() {
+            return false;
+        }
+
+        let session = self.registration.take().expect("checked Some above");
+        let RegistrationSession {
+            reading,
+            draft: word,
+            ..
+        } = *session;
+
+        if let Some(dict) = self
+            .dictionaries
+            .iter()
+            .find(|d| d.mode() == DictionaryMode::ReadWrite)
+        {
+            if dict.record_registration(&reading, &word).is_ok() {
+                let _ = dict.save();
+            }
+        }
+
+        self.discard_staged();
+        self.committed_output = Some(word);
+        true
+    }
+
+    /// Discards the candidate that was staged right before Ctrl-R, without
+    /// committing or learning it (D-179/D-181's prerequisite: a candidate
+    /// that was on-screen when registration began is neither committed nor
+    /// recorded once registration finishes or is cancelled). Deliberately
+    /// does not go through `flush_last_commit` - that path commits and learns.
+    fn discard_staged(&mut self) {
+        self.last_commit = None;
+        self.state = ConversionState::Input;
+        self.candidates.clear();
+        self.candidate_index = -1;
+        self.preedit.clear();
+    }
+
+    /// Pulls whatever the active registration step just committed up into
+    /// this context's `draft` (REG-02)
+    ///
+    /// Called once per key event by capi, after routing the key to
+    /// `active_mut()`. Walks from the outermost registration step down: each
+    /// step first lets its own (possibly still-registering) `inner` absorb
+    /// its own output, then polls `inner.poll_output()` into its own `draft`.
+    /// This is what keeps an inner step's commits from ever reaching the
+    /// application directly (REG-02) - and, once an inner step finishes via
+    /// `finish_registration`, what carries its now-registered word up into
+    /// its parent's `draft` too (D-171). A no-op outside registration.
+    pub fn absorb_registration_output(&mut self) {
+        if let Some(session) = self.registration.as_mut() {
+            session.inner.absorb_registration_output();
+            if let Some(text) = session.inner.poll_output() {
+                session.draft.push_str(&text);
+            }
+        }
+    }
+
+    /// The outermost registration step's typed reading, for the application
+    /// input position (client preedit, D-170) - `None` outside registration
+    pub fn registration_reading(&self) -> Option<&str> {
+        self.registration
+            .as_ref()
+            .map(|session| session.reading.as_str())
+    }
+
+    /// The registration popup's label (D-170/D-171): every **nested** step's
+    /// reading (second level and deeper - the outermost step's own reading is
+    /// shown separately, in the application's input position via
+    /// `registration_reading`, not repeated here) from the outside in, each
+    /// followed by a half-width space, then `REGISTRATION_LABEL` ("登録 ").
+    /// A single-step registration ("Sekka C-j C-r") is just `"登録 "`; a step
+    /// nested inside another (recursively registering the word for an inner
+    /// reading) prefixes the intervening reading(s) first. `None` outside
+    /// registration.
+    pub fn registration_prompt(&self) -> Option<String> {
+        let session = self.registration.as_ref()?;
+        let mut prompt = String::new();
+        let mut current = session.inner.registration.as_ref();
+        while let Some(inner_session) = current {
+            prompt.push_str(&inner_session.reading);
+            prompt.push(' ');
+            current = inner_session.inner.registration.as_ref();
+        }
+        prompt.push_str(REGISTRATION_LABEL);
+        Some(prompt)
+    }
+
+    /// The word being assembled in the innermost registration step (D-171):
+    /// the innermost step's `draft` plus its `inner`'s current preedit (the
+    /// candidate on screen, or the romaji buffer while typing). An outer
+    /// step's own in-progress word is deliberately not shown - only the
+    /// innermost step's is (D-171). `None` outside registration.
+    pub fn registration_word(&self) -> Option<String> {
+        let mut current = self.registration.as_ref()?;
+        loop {
+            match current.inner.registration.as_ref() {
+                Some(inner_session) => current = inner_session,
+                None => break,
+            }
+        }
+        Some(format!("{}{}", current.draft, current.inner.get_preedit()))
     }
 
     /// Adds a dictionary
@@ -631,12 +922,15 @@ impl SekkaContext {
         // active before reselection began (`begin_reselect` clones its candidates
         // but never takes `last_commit`, so it is still Some here). A word
         // confirmed during reselection must revert to the same romaji as the
-        // word it replaced.
-        let raw_romaji = self
-            .last_commit
-            .take()
-            .map(|last| last.raw_romaji)
+        // word it replaced. D-168 (Phase 10): the typed reading is carried over
+        // the same way, so a word confirmed during reselection still registers
+        // under the reading the user originally typed.
+        let taken = self.last_commit.take();
+        let raw_romaji = taken
+            .as_ref()
+            .map(|last| last.raw_romaji.clone())
             .unwrap_or_default();
+        let reading = taken.map(|last| last.reading).unwrap_or_default();
 
         self.preedit = output.clone();
         self.last_commit = Some(LastCommit {
@@ -644,6 +938,7 @@ impl SekkaContext {
             candidates: std::mem::take(&mut self.candidates),
             index,
             raw_romaji,
+            reading,
         });
         debug_assert!(
             self.last_commit.is_none() || self.romaji_buffer.is_empty(),
@@ -752,8 +1047,11 @@ impl SekkaContext {
         self.state = ConversionState::Converting;
 
         // Consult the dictionary in every mode and build the hiragana, katakana and
-        // alphabet candidates in upstream's order (D-07).
-        self.candidates = self.build_candidate_list();
+        // alphabet candidates in upstream's order (D-07). The second element (D-168)
+        // is kept only for the non-empty-candidates branch below; the empty-candidates
+        // branch has nothing to register (there is no staged word), so it is dropped.
+        let (candidates, reading) = self.build_candidate_list();
+        self.candidates = candidates;
 
         // Candidate building has finished reading the romaji buffer, so empty it right
         // here (before setting last_commit). That way the invariant "if last_commit is
@@ -778,6 +1076,7 @@ impl SekkaContext {
                 candidates: std::mem::take(&mut self.candidates),
                 index: 0,
                 raw_romaji,
+                reading,
             });
             debug_assert!(
                 self.last_commit.is_none() || self.romaji_buffer.is_empty(),
@@ -821,7 +1120,16 @@ impl SekkaContext {
     /// hiragana, katakana and alphabet candidates in upstream's order, D-07) (D-24).
     /// `Symbol` (symbols and anything else, branch 6) is delegated to
     /// `build_symbol_candidates`.
-    fn build_candidate_list(&self) -> Vec<Candidate> {
+    ///
+    /// The second element of the returned tuple is the typed reading for
+    /// registration (D-168/D-169, Phase 10): for `CaseBased` /
+    /// `HiraganaConvertible` input with no okurigana it is a copy of
+    /// `full_kana` (the plain kana reading of what the user typed); for
+    /// okuri-ari input in the same two branches, and for every other branch
+    /// (`NumberOnly` / `NumberPrefixed` / `Symbol`), it is empty - none of
+    /// those shapes have a plain kana reading a user dictionary entry could be
+    /// filed under, so registration on them is refused (D-169, a later plan).
+    fn build_candidate_list(&self) -> (Vec<Candidate>, String) {
         match classify_input_shape(&self.romaji_buffer) {
             InputShape::CaseBased | InputShape::HiraganaConvertible => {
                 let request = analyze_input(&self.romaji_buffer);
@@ -835,6 +1143,11 @@ impl SekkaContext {
                     self.romaji_to_kana(&okuri_romaji)
                 };
                 let full_kana = format!("{}{}", stem_kana, okuri_kana);
+                let reading = if okuri_romaji.is_empty() {
+                    full_kana.clone()
+                } else {
+                    String::new()
+                };
 
                 let mut list =
                     self.lookup_dictionary(&stem_romaji, &stem_kana, &okuri_kana, &okuri_romaji);
@@ -844,13 +1157,17 @@ impl SekkaContext {
                 list.push(alphabet_hankaku_candidate(&self.romaji_buffer));
 
                 sort_candidates(&mut list, request.mode);
-                list
+                (list, reading)
             }
-            InputShape::NumberOnly => self.build_number_candidates(&self.romaji_buffer),
-            InputShape::NumberPrefixed => {
-                self.build_number_prefixed_candidates(&self.romaji_buffer)
-            }
-            InputShape::Symbol => self.build_symbol_candidates(),
+            InputShape::NumberOnly => (
+                self.build_number_candidates(&self.romaji_buffer),
+                String::new(),
+            ),
+            InputShape::NumberPrefixed => (
+                self.build_number_prefixed_candidates(&self.romaji_buffer),
+                String::new(),
+            ),
+            InputShape::Symbol => (self.build_symbol_candidates(), String::new()),
         }
     }
 
@@ -4295,5 +4612,98 @@ mod tests {
             1,
             "the save of the second should still be attempted even when the first fails"
         );
+    }
+
+    // === Word registration (Phase 10) ===
+
+    /// D-168: the typed reading ("せっかい", what the user actually typed) is
+    /// what registration captures, not `Candidate.reading` (the dictionary
+    /// headword, "せっか") - even when the staged candidate came from a
+    /// SymSpell path-2 fuzzy match (a delete variant of the typed reading is
+    /// itself a dictionary key).
+    #[test]
+    fn registration_entry_captures_the_typed_reading_not_the_candidate_reading() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        for ch in "Sekkai".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(
+            ctx.get_preedit(),
+            "赤化",
+            "SymSpell path 2 should stage 赤化 for a typo of せっか - if this \
+             assumption broke, stop here and report rather than weaken the \
+             expectation"
+        );
+
+        assert!(
+            ctx.begin_registration(),
+            "begin_registration should succeed with a staged candidate"
+        );
+        assert_eq!(ctx.registration_reading(), Some("せっかい"));
+        assert_eq!(ctx.registration_prompt(), Some("登録 ".to_string()));
+        assert_eq!(ctx.registration_word(), Some(String::new()));
+    }
+
+    /// REG-02 / D-172 / D-35: inner commits during registration never reach
+    /// the application (outer `get_preedit()`/`poll_output()`) - they are
+    /// absorbed into the word being assembled, and only the outermost step's
+    /// Enter finally commits. Also confirms `finish_registration` succeeds
+    /// even when no `ReadWrite` dictionary is set (D-35: a recording failure
+    /// - or here, nothing to record into - never blocks the commit).
+    #[test]
+    fn registration_inner_isolation_keeps_inner_commits_out_of_the_application() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "赤化");
+
+        assert!(ctx.begin_registration());
+
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+
+        ctx.active_mut().process_key('K', false);
+        ctx.absorb_registration_output();
+
+        assert_eq!(
+            ctx.poll_output(),
+            None,
+            "nothing should reach the application while registering"
+        );
+        assert_eq!(ctx.registration_word(), Some("石K".to_string()));
+        assert_eq!(
+            ctx.get_preedit(),
+            "赤化",
+            "the outer context's own preedit stays frozen at the moment Ctrl-R was pressed"
+        );
+
+        ctx.active_mut().process_key('a', false);
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("石火".to_string()));
+
+        assert!(
+            ctx.finish_registration(),
+            "finish_registration should succeed even with no ReadWrite dictionary set"
+        );
+        assert_eq!(ctx.poll_output(), Some("石火".to_string()));
+        assert!(!ctx.is_registering());
+        assert_eq!(ctx.get_preedit(), "");
     }
 }

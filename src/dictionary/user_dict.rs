@@ -86,6 +86,107 @@ impl UserDict {
             None => Ok(Vec::new()),
         }
     }
+
+    /// Shared read-modify-write primitive behind both `record_selection`
+    /// (+1) and `record_registration` (D-182: move to the head), so that
+    /// every write to the user dictionary goes through exactly one CAS
+    /// discipline and exactly one pair of index-update hooks (RESEARCH
+    /// Pitfall 1/4: an index hook duplicated per write-path is exactly the
+    /// kind of place a future write-path could silently miss it).
+    ///
+    /// The read-modify-write is confined to a single `sled::Tree::fetch_and_update`
+    /// call (a compare-and-swap), so `apply`'s effect is not lost when several
+    /// threads record against the same reading concurrently
+    /// (`record-selection-lost-update`, `01.2-REVIEW` WR-02 / `01.4-REVIEW`
+    /// WR-02; pinned by a regression test where 8 threads x 100 iterations must
+    /// land on exactly 800, for both callers).
+    ///
+    /// If either deserialization or serialization fails, the closure **returns
+    /// the unmodified byte slice as `Some`** (an effectively no-op update).
+    /// Returning `None` from a `fetch_and_update` closure deletes the key (the
+    /// `next: None` of the `compare_and_swap(key, tmp, next)` that sled 0.34.7
+    /// `tree.rs:715-738` calls internally is CASed as a deletion), so returning
+    /// `None` here would destroy the user's learning data itself. Errors are
+    /// captured into `serialize_error` outside the closure and propagated after
+    /// `fetch_and_update` returns. Because `fetch_and_update` re-runs the closure
+    /// on every CAS conflict, `serialize_error` is **reset to `None` at the top
+    /// of the closure every time** (04-REVIEW.md WR-01). Without that reset, an
+    /// error raised by a losing call could be returned as the result of the call
+    /// that subsequently won the CAS (no data is lost, but a call that actually
+    /// succeeded is reported as `Err` - a false negative).
+    ///
+    /// `apply` receives the reading's current entries (empty when the key does
+    /// not yet exist) and mutates them in place; it may be called more than
+    /// once (retried on every CAS conflict), so it must have no side effects
+    /// beyond mutating its argument.
+    fn update_entries_atomically<F>(&self, reading: &str, mut apply: F) -> Result<(), DictError>
+    where
+        F: FnMut(&mut Vec<DictEntry>),
+    {
+        let mut serialize_error: Option<DictError> = None;
+
+        self.db
+            .fetch_and_update(reading.as_bytes(), |old: Option<&[u8]>| {
+                // Always reset on every CAS retry (04-REVIEW.md WR-01).
+                // `fetch_and_update` re-runs this closure on every CAS conflict,
+                // but `serialize_error` is a single variable declared outside the
+                // closure, so without a reset here an error raised by the
+                // previous (losing) call would survive and masquerade as the
+                // result of this (winning) call. Resetting per call guarantees
+                // that the value finally observed always belongs to the most
+                // recent call - the one whose CAS actually succeeded.
+                serialize_error = None;
+                let mut entries: Vec<DictEntry> = match old {
+                    Some(bytes) => match serde_json::from_slice(bytes) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            // Deserialization failed: return the original bytes
+                            // unmodified (returning None would delete the key).
+                            serialize_error = Some(DictError::SerializationError(e.to_string()));
+                            return old.map(|b| b.to_vec());
+                        }
+                    },
+                    None => Vec::new(),
+                };
+
+                apply(&mut entries);
+
+                match serde_json::to_vec(&entries) {
+                    Ok(json) => Some(json),
+                    Err(e) => {
+                        serialize_error = Some(DictError::SerializationError(e.to_string()));
+                        old.map(|b| b.to_vec())
+                    }
+                }
+            })
+            .map_err(DictError::BackendError)?;
+
+        if let Some(e) = serialize_error {
+            return Err(e);
+        }
+
+        // The hooks for D-73/D-95 (Pitfall 2: outside the CAS, exactly once after
+        // success is certain). Both `insert` calls deduplicate internally, so
+        // they are idempotent; putting them here expresses the design intent
+        // that this is one-shot post-processing unrelated to the number of CAS
+        // retries. Do not drop either hook - the romaji index of D-73 or the
+        // SymSpell index of D-95 (as the warning in the code says).
+        // D-73/D-95 used to have no observable effect through `record_selection`
+        // alone (every user dictionary key also existed in the master
+        // dictionary, since `learn_pair` only becomes `Some` for a candidate
+        // that already came from some dictionary). Phase 10's word registration
+        // (D-182, `record_registration`) is what first creates a reading that
+        // exists only in the user dictionary, and this shared hook is what
+        // makes that reading reachable through fuzzy search (REG-08).
+        if let Ok(mut idx) = self.roman_index.write() {
+            idx.insert(reading);
+        }
+        if let Ok(mut idx) = self.symspell_index.write() {
+            idx.insert(reading);
+        }
+
+        Ok(())
+    }
 }
 
 impl Dictionary for UserDict {
@@ -135,100 +236,51 @@ impl Dictionary for UserDict {
     ///
     /// Increments the selection frequency of the candidate for the given
     /// reading. When no such entry exists, it is created with frequency 1 (D-40:
-    /// keep the overlay sparse).
-    ///
-    /// The read-modify-write is confined to a single `sled::Tree::fetch_and_update`
-    /// call (a compare-and-swap), so increments are not lost when several threads
-    /// record against the same reading concurrently
-    /// (`record-selection-lost-update`, `01.2-REVIEW` WR-02 / `01.4-REVIEW`
-    /// WR-02; pinned by a regression test where 8 threads x 100 iterations must
-    /// land on exactly 800).
-    ///
-    /// If either deserialization or serialization fails, the closure **returns
-    /// the unmodified byte slice as `Some`** (an effectively no-op update).
-    /// Returning `None` from a `fetch_and_update` closure deletes the key (the
-    /// `next: None` of the `compare_and_swap(key, tmp, next)` that sled 0.34.7
-    /// `tree.rs:715-738` calls internally is CASed as a deletion), so returning
-    /// `None` here would destroy the user's learning data itself. Errors are
-    /// captured into `serialize_error` outside the closure and propagated after
-    /// `fetch_and_update` returns. Because `fetch_and_update` re-runs the closure
-    /// on every CAS conflict, `serialize_error` is **reset to `None` at the top
-    /// of the closure every time** (04-REVIEW.md WR-01). Without that reset, an
-    /// error raised by a losing call could be returned as the result of the call
-    /// that subsequently won the CAS (no data is lost, but a call that actually
-    /// succeeded is reported as `Err` - a false negative).
+    /// keep the overlay sparse). Implemented as a single `update_entries_atomically`
+    /// call whose closure applies exactly this rule; see that method's
+    /// documentation for the CAS discipline (atomicity, error handling, the
+    /// index hooks) shared with `record_registration`.
     fn record_selection(&self, reading: &str, word: &str) -> Result<(), DictError> {
-        let mut serialize_error: Option<DictError> = None;
-
-        self.db
-            .fetch_and_update(reading.as_bytes(), |old: Option<&[u8]>| {
-                // Always reset on every CAS retry (04-REVIEW.md WR-01).
-                // `fetch_and_update` re-runs this closure on every CAS conflict,
-                // but `serialize_error` is a single variable declared outside the
-                // closure, so without a reset here an error raised by the
-                // previous (losing) call would survive and masquerade as the
-                // result of this (winning) call. Resetting per call guarantees
-                // that the value finally observed always belongs to the most
-                // recent call - the one whose CAS actually succeeded.
-                serialize_error = None;
-                let mut entries: Vec<DictEntry> = match old {
-                    Some(bytes) => match serde_json::from_slice(bytes) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            // Deserialization failed: return the original bytes
-                            // unmodified (returning None would delete the key).
-                            serialize_error = Some(DictError::SerializationError(e.to_string()));
-                            return old.map(|b| b.to_vec());
-                        }
-                    },
-                    None => Vec::new(),
-                };
-
-                let mut found = false;
-                for entry in entries.iter_mut() {
-                    if entry.word == word {
-                        entry.frequency += 1;
-                        found = true;
-                        break;
-                    }
+        self.update_entries_atomically(reading, |entries| {
+            let mut found = false;
+            for entry in entries.iter_mut() {
+                if entry.word == word {
+                    entry.frequency += 1;
+                    found = true;
+                    break;
                 }
-                if !found {
-                    entries.push(DictEntry::new(word).with_frequency(1));
+            }
+            if !found {
+                entries.push(DictEntry::new(word).with_frequency(1));
+            }
+        })
+    }
+
+    /// Moves a registered word to the head of its reading (D-182, Phase 10)
+    ///
+    /// The new frequency is the maximum frequency among `reading`'s existing
+    /// entries, plus one - for both a brand new word and a re-registration of
+    /// the same (reading, word) pair (REG-06: the existing entry's frequency
+    /// is replaced, not duplicated, so re-registering never creates a second
+    /// entry for the same pair). Implemented as a single
+    /// `update_entries_atomically` call; see that method's documentation for
+    /// the CAS discipline shared with `record_selection`.
+    fn record_registration(&self, reading: &str, word: &str) -> Result<(), DictError> {
+        self.update_entries_atomically(reading, |entries| {
+            let max_frequency = entries.iter().map(|e| e.frequency).max().unwrap_or(0);
+            let new_frequency = max_frequency.saturating_add(1);
+            let mut found = false;
+            for entry in entries.iter_mut() {
+                if entry.word == word {
+                    entry.frequency = new_frequency;
+                    found = true;
+                    break;
                 }
-
-                match serde_json::to_vec(&entries) {
-                    Ok(json) => Some(json),
-                    Err(e) => {
-                        serialize_error = Some(DictError::SerializationError(e.to_string()));
-                        old.map(|b| b.to_vec())
-                    }
-                }
-            })
-            .map_err(DictError::BackendError)?;
-
-        if let Some(e) = serialize_error {
-            return Err(e);
-        }
-
-        // The hooks for D-73/D-95 (Pitfall 2: outside the CAS, exactly once after
-        // success is certain). Both `insert` calls deduplicate internally, so
-        // they are idempotent; putting them here expresses the design intent
-        // that this is one-shot post-processing unrelated to the number of CAS
-        // retries. Do not drop either hook - the romaji index of D-73 or the
-        // SymSpell index of D-95 (as the warning in the code says).
-        // D-73/D-95 currently have no observable effect (`learn_pair` only
-        // becomes `Some` in `build_candidates` in `candidate.rs`, and libsekka
-        // has no word-registration feature, so every user dictionary key also
-        // exists in the master dictionary. The structure mirrors upstream as the
-        // foundation for a future word-registration feature).
-        if let Ok(mut idx) = self.roman_index.write() {
-            idx.insert(reading);
-        }
-        if let Ok(mut idx) = self.symspell_index.write() {
-            idx.insert(reading);
-        }
-
-        Ok(())
+            }
+            if !found {
+                entries.push(DictEntry::new(word).with_frequency(new_frequency));
+            }
+        })
     }
 
     /// Delegates a save request through the trait to `UserDict::save()`

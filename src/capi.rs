@@ -113,7 +113,7 @@ fn is_printable_ascii(keysym: u32) -> bool {
 /// own entry in this table (closes the candidate window and reverts to the
 /// original romaji, D-160) instead of falling through to "other key" like it used
 /// to.
-fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> bool {
+fn handle_selecting_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) -> bool {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
     if other {
@@ -126,7 +126,7 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
         // Nothing is committed and nothing is forwarded. `last_commit` is always
         // Some while Selecting (`begin_reselect` never enters without one), so
         // this is always consumed.
-        let consumed = ctx.ctx.backspace();
+        let consumed = ctx.backspace();
         debug_assert!(
             consumed,
             "BackSpace during reselection must always be consumed (last_commit is Some)"
@@ -136,54 +136,54 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
 
     if ctrl {
         if ctrl_letter(keysym, b'j') || ctrl_letter(keysym, b'n') {
-            ctx.ctx.next_candidate();
+            ctx.next_candidate();
             return true;
         }
         if ctrl_letter(keysym, b'p') {
-            ctx.ctx.prev_candidate();
+            ctx.prev_candidate();
             return true;
         }
         if ctrl_letter(keysym, b'm') {
-            ctx.ctx.confirm();
+            ctx.confirm();
             return true;
         }
         if ctrl_letter(keysym, b'g') {
-            ctx.ctx.cancel();
+            ctx.cancel();
             return true;
         }
         if ctrl_letter(keysym, b'a') {
-            ctx.ctx.select_kanji();
+            ctx.select_kanji();
             return true;
         }
         if ctrl_letter(keysym, b'u') {
-            ctx.ctx.select_hiragana();
+            ctx.select_hiragana();
             return true;
         }
         if ctrl_letter(keysym, b'i') || ctrl_letter(keysym, b'k') {
-            ctx.ctx.select_katakana();
+            ctx.select_katakana();
             return true;
         }
         if ctrl_letter(keysym, b'l') {
-            ctx.ctx.select_hankaku();
+            ctx.select_hankaku();
             return true;
         }
         if ctrl_letter(keysym, b'e') {
-            ctx.ctx.select_zenkaku();
+            ctx.select_zenkaku();
             return true;
         }
         return false;
     }
 
     if keysym == 0x20 {
-        ctx.ctx.next_candidate();
+        ctx.next_candidate();
         return true;
     }
     if keysym == 0xFF0D || keysym == 0xFF8D {
-        ctx.ctx.confirm();
+        ctx.confirm();
         return true;
     }
     if keysym == 0xFF1B || keysym == b'q' as u32 {
-        ctx.ctx.cancel();
+        ctx.cancel();
         return true;
     }
 
@@ -224,9 +224,29 @@ fn handle_selecting_key(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) 
 /// (space and every symbol not accepted by `is_romaji_char`) is instead appended
 /// to whatever this key event commits and is not forwarded (D-162 keeps the
 /// Ctrl/Alt/Super and non-printable case as-is).
-fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_int {
+///
+/// D-167 (Phase 10): Ctrl-R in the commit display state (a staged candidate is
+/// present) enters word registration instead. It is judged first, before even
+/// the BackSpace check, and in particular before the single D-12 flush point
+/// below - flushing first would commit `last_commit` and lose the typed
+/// reading it carries (the same reason BackSpace is judged early, D-160). A
+/// shape refused by `begin_registration` (D-169, a later plan) is still
+/// consumed here and changes nothing else. Outside the commit display state
+/// (nothing staged, or still typing romaji) Ctrl-R falls through unchanged and
+/// keeps D-03's plain Ctrl+letter handling.
+fn dispatch_input(
+    ctx: &mut SekkaContext,
+    forward_key: &mut bool,
+    keysym: u32,
+    modifiers: u32,
+) -> c_int {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+
+    if ctrl && !other && ctrl_letter(keysym, b'r') && ctx.has_staged_candidate() {
+        ctx.begin_registration();
+        return 1;
+    }
 
     // D-160: BackSpace is judged before the single D-12 flush point below
     // (placing it after would commit the staged candidate first — RESEARCH
@@ -235,17 +255,17 @@ fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_i
     // nothing. Once the romaji buffer is exhausted, a further BackSpace is
     // unconsumed and reaches the application untouched, as an ordinary BackSpace.
     if !ctrl && !other && keysym == 0xFF08 {
-        return if ctx.ctx.backspace() { 1 } else { 0 };
+        return if ctx.backspace() { 1 } else { 0 };
     }
 
     // The single flush point of D-12, for every key other than BackSpace: commit
     // any unsent staged candidate exactly once, here (following the Anti-Patterns
     // entry "flushing in several places" in RESEARCH.md, this happens once per
     // key event and only here).
-    let flushed = ctx.ctx.flush_last_commit();
+    let flushed = ctx.flush_last_commit();
 
     if !ctrl && !other && is_romaji_char(keysym) {
-        ctx.ctx.process_key(keysym as u8 as char, false);
+        ctx.process_key(keysym as u8 as char, false);
         return 1;
     }
 
@@ -256,7 +276,7 @@ fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_i
     // there is nothing to commit it stays unconsumed and reaches the application
     // untouched.
     if !ctrl && !other && is_printable_ascii(keysym) {
-        return if ctx.ctx.commit_with_trailing_char(keysym as u8 as char) {
+        return if ctx.commit_with_trailing_char(keysym as u8 as char) {
             1
         } else {
             0
@@ -267,17 +287,74 @@ fn dispatch_input(ctx: &mut SekkaContextFfi, keysym: u32, modifiers: u32) -> c_i
     // commit the romaji as it is and forward the key too (D-03). Since D-158
     // (Phase 9), the only keys that reach this branch are non-printable keys and
     // Ctrl/Alt/Super-modified keys (D-166: history kept, not erased).
-    if ctx.ctx.commit_raw_romaji() {
-        ctx.forward_key = true;
+    if ctx.commit_raw_romaji() {
+        *forward_key = true;
         return 1;
     }
     // The invariant (a true `flushed` means the romaji buffer is empty) makes it
     // impossible for commit_raw_romaji above and this branch to both apply.
     if flushed {
-        ctx.forward_key = true;
+        *forward_key = true;
         return 1;
     }
     0
+}
+
+/// Dispatches a key event to the input context that should receive it
+/// (D-171/ARCHITECTURE case C, Phase 10)
+///
+/// Selects between `handle_selecting_key` and `dispatch_input` by
+/// `ctx.state()`, and on a `handle_selecting_key` miss, confirms and
+/// reprocesses through `dispatch_input` exactly as
+/// `sekka_context_process_key_event` used to do inline. This is the whole
+/// non-trigger key-routing decision, factored out so `handle_registration_key`
+/// can send a key to the innermost registration step's context the same way
+/// the top-level FFI entry point sends it to the top-level context.
+fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifiers: u32) -> c_int {
+    if ctx.state() == ConversionState::Selecting {
+        if handle_selecting_key(ctx, keysym, modifiers) {
+            return 1;
+        }
+        // Other key (D-09): confirm with the selected candidate, then
+        // reprocess the same key as the Input state (with an empty buffer). A
+        // character key starts new romaji input; a printable key is appended
+        // to the confirmed candidate (D-158); a non-printable key is
+        // forwarded (D-03/D-162).
+        ctx.confirm();
+        let result = dispatch_input(ctx, forward_key, keysym, modifiers);
+        if result == 0 {
+            *forward_key = true;
+            return 1;
+        }
+        return result;
+    }
+
+    dispatch_input(ctx, forward_key, keysym, modifiers)
+}
+
+/// Dispatches a key event while registering (D-172/D-176/REG-02, Phase 10)
+///
+/// An Enter with no modifier finishes the current registration step
+/// (`finish_registration`, D-172/D-176). Every other key is routed to the
+/// innermost step's context via `route_key`, exactly like an ordinary key
+/// event, except that its forward-key result is always discarded - nothing
+/// typed while registering is ever forwarded to the application (REG-02;
+/// what would normally be forwarded, such as Ctrl/Alt/Super-modified keys or
+/// Enter itself outside registration, simply has no effect here beyond
+/// whatever `route_key` already did to the inner context). The caller is
+/// responsible for calling `ctx.absorb_registration_output()` afterward
+/// (REG-02: pulling any newly committed inner output up into `draft` is a
+/// separate step, shared with the trigger path).
+fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) {
+    let ctrl = (modifiers & MOD_CTRL) != 0;
+    let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+    if !ctrl && !other && (keysym == 0xFF0D || keysym == 0xFF8D) {
+        ctx.finish_registration();
+        return;
+    }
+
+    let mut discarded_forward = false;
+    route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
 }
 
 // ---------------------------------------------------------------------------
@@ -439,26 +516,18 @@ pub unsafe extern "C" fn sekka_context_process_key_event(
             return 0;
         }
 
-        use crate::context::ConversionState;
-        if ctx.ctx.state() == ConversionState::Selecting {
-            if handle_selecting_key(ctx, keysym, modifiers) {
-                return 1;
-            }
-            // Other key (D-09): confirm with the selected candidate, then
-            // reprocess the same key as the Input state (with an empty buffer). A
-            // character key starts new romaji input; a printable key is appended
-            // to the confirmed candidate (D-158); a non-printable key is
-            // forwarded (D-03/D-162).
-            ctx.ctx.confirm();
-            let result = dispatch_input(ctx, keysym, modifiers);
-            if result == 0 {
-                ctx.forward_key = true;
-                return 1;
-            }
-            return result;
+        // Phase 10: while registering, every key is consumed by the
+        // registration mode itself (REG-02 - nothing is ever forwarded to the
+        // application from here). `handle_registration_key` routes to the
+        // innermost step's context; `absorb_registration_output` then pulls
+        // whatever that step just committed up into its parent's draft.
+        if ctx.ctx.is_registering() {
+            handle_registration_key(&mut ctx.ctx, keysym, modifiers);
+            ctx.ctx.absorb_registration_output();
+            return 1;
         }
 
-        dispatch_input(ctx, keysym, modifiers)
+        route_key(&mut ctx.ctx, &mut ctx.forward_key, keysym, modifiers)
     }))
     .unwrap_or(0)
 }
@@ -491,6 +560,10 @@ pub unsafe extern "C" fn sekka_context_take_forward_key(ctx: *mut SekkaContextFf
 
 /// Gets the preedit string
 ///
+/// While registering (Phase 10), returns `registration_word()` instead - the
+/// word being assembled in the popup (D-170). The application's own preedit
+/// during registration is `sekka_context_get_registration_reading` instead.
+///
 /// The caller is responsible for freeing the returned pointer with `sekka_free_string`.
 /// Returns NULL for a NULL pointer or on panic.
 ///
@@ -503,7 +576,10 @@ pub unsafe extern "C" fn sekka_context_get_preedit(ctx: *mut SekkaContextFfi) ->
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &mut *ctx };
-        let preedit = ctx.ctx.get_preedit().to_string();
+        let preedit = ctx
+            .ctx
+            .registration_word()
+            .unwrap_or_else(|| ctx.ctx.get_preedit().to_string());
         match CString::new(preedit) {
             Ok(cstr) => cstr.into_raw(),
             Err(_) => ptr::null_mut(),
@@ -514,7 +590,8 @@ pub unsafe extern "C" fn sekka_context_get_preedit(ctx: *mut SekkaContextFfi) ->
 
 /// Gets the cursor position within the preedit
 ///
-/// Returns the cursor position in bytes.
+/// Returns the cursor position in bytes. While registering, this is the byte
+/// length of `registration_word()` (see `sekka_context_get_preedit`).
 /// Returns 0 for a NULL pointer or on panic.
 ///
 /// # Safety
@@ -526,7 +603,10 @@ pub unsafe extern "C" fn sekka_context_get_preedit_cursor_pos(ctx: *mut SekkaCon
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &mut *ctx };
-        ctx.ctx.get_preedit().len() as c_int
+        match ctx.ctx.registration_word() {
+            Some(word) => word.len() as c_int,
+            None => ctx.ctx.get_preedit().len() as c_int,
+        }
     }))
     .unwrap_or(0)
 }
@@ -977,6 +1057,87 @@ pub unsafe extern "C" fn sekka_context_get_candidate_index(ctx: *mut SekkaContex
     .unwrap_or(-1)
 }
 
+// ---------------------------------------------------------------------------
+// Word registration (Phase 10)
+// ---------------------------------------------------------------------------
+
+/// Returns whether word registration is active (D-170)
+///
+/// Returns 0 (not registering) for a NULL pointer or on panic.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_is_registering(ctx: *mut SekkaContextFfi) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*ctx };
+        if ctx.ctx.is_registering() {
+            1
+        } else {
+            0
+        }
+    }))
+    .unwrap_or(0)
+}
+
+/// Gets the outermost registration step's typed reading (D-168/D-170)
+///
+/// For the application's own input position (client preedit): just the
+/// reading, with no label and no inner-step content. Returns an empty string
+/// (not NULL) when not registering. The caller is responsible for freeing the
+/// returned pointer with `sekka_free_string`. Returns NULL for a NULL pointer
+/// or on panic.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_get_registration_reading(
+    ctx: *mut SekkaContextFfi,
+) -> *mut c_char {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*ctx };
+        let reading = ctx.ctx.registration_reading().unwrap_or("").to_string();
+        match CString::new(reading) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
+/// Gets the registration popup's label (`registration_prompt()`, D-170)
+///
+/// For the popup's auxUp: every nested step's reading followed by "登録 ".
+/// Returns an empty string (not NULL) when not registering. The caller is
+/// responsible for freeing the returned pointer with `sekka_free_string`.
+/// Returns NULL for a NULL pointer or on panic.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_get_registration_prompt(
+    ctx: *mut SekkaContextFfi,
+) -> *mut c_char {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*ctx };
+        let prompt = ctx.ctx.registration_prompt().unwrap_or_default();
+        match CString::new(prompt) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Frees the memory of a candidate list
 ///
 /// Pass the return value of `sekka_context_get_candidates` straight through as
@@ -1071,6 +1232,16 @@ pub unsafe extern "C" fn sekka_context_trigger(ctx: *mut SekkaContextFfi) -> c_i
         // this, the forward flag of the previous key event would survive and a
         // trigger press would deliver the raw key to the application twice.
         ctx.forward_key = false;
+
+        // Phase 10: while registering, the trigger is just an ordinary key
+        // routed to the innermost step (Ctrl-J conversion inside the word
+        // being assembled, REG-02) and always consumed - never forwarded.
+        if ctx.ctx.is_registering() {
+            ctx.ctx.active_mut().process_key('\0', true);
+            ctx.ctx.absorb_registration_output();
+            return 1;
+        }
+
         if ctx.ctx.process_key('\0', true) {
             1
         } else {
@@ -3630,6 +3801,125 @@ mod tests {
                 0,
                 "trigger carried over the forward flag from the previous event"
             );
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    // === Word registration (D-167/D-170/D-172/D-182/REG-07, Phase 10) ===
+
+    /// The tracer's own key-by-key sequence through the C ABI: `S e k k a`
+    /// C-j C-r `S e k i` C-j `K a` C-j Enter registers "せきか" under the
+    /// reading "せっか" and commits it; the next `S e k k a` C-j offers the
+    /// registered word first (REG-07).
+    #[test]
+    fn registration_entry_registers_the_word_and_commits_it_through_the_c_abi() {
+        unsafe {
+            let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+            let dict_path = tmp.path().join("test_user_dict");
+            let path_cstr =
+                CString::new(dict_path.to_str().unwrap()).expect("failed to build the CString");
+            let mut dict = sekka_user_dict_new(path_cstr.as_ptr(), ptr::null());
+            assert!(!dict.is_null());
+
+            let ctx = sekka_context_new();
+            sekka_context_set_dictionaries(ctx, &mut dict, 1);
+
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            let staged = sekka_context_trigger(ctx);
+            assert_eq!(staged, 1);
+            let staged_output = sekka_context_poll_output(ctx);
+            assert!(
+                staged_output.is_null(),
+                "nothing should be committed right after Ctrl-J"
+            );
+
+            // C-r ('r', Ctrl = 0x4).
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            let entry_output = sekka_context_poll_output(ctx);
+            assert!(entry_output.is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(reg_reading_string(ctx), "せっか");
+            assert_eq!(reg_prompt_string(ctx), "登録 ");
+            assert_eq!(preedit_string(ctx), "");
+
+            for ch in "Seki".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "せき");
+
+            for ch in "Ka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            assert_eq!(preedit_string(ctx), "せきKa");
+            let mid_output = sekka_context_poll_output(ctx);
+            assert!(mid_output.is_null());
+
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "せきか");
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "せきか");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            assert_eq!(
+                preedit_string(ctx),
+                "せきか",
+                "the word registered under せっか should be the first candidate (REG-07)"
+            );
+
+            sekka_context_free(ctx);
+            sekka_free_dictionary(dict);
+        }
+    }
+
+    /// Helper: returns `sekka_context_get_registration_reading` as an owned `String`.
+    unsafe fn reg_reading_string(ctx: *mut SekkaContextFfi) -> String {
+        unsafe {
+            let reading = sekka_context_get_registration_reading(ctx);
+            assert!(!reading.is_null());
+            let s = CStr::from_ptr(reading).to_str().unwrap().to_string();
+            sekka_free_string(reading);
+            s
+        }
+    }
+
+    /// Helper: returns `sekka_context_get_registration_prompt` as an owned `String`.
+    unsafe fn reg_prompt_string(ctx: *mut SekkaContextFfi) -> String {
+        unsafe {
+            let prompt = sekka_context_get_registration_prompt(ctx);
+            assert!(!prompt.is_null());
+            let s = CStr::from_ptr(prompt).to_str().unwrap().to_string();
+            sekka_free_string(prompt);
+            s
+        }
+    }
+
+    #[test]
+    fn registration_getters_are_null_safe_and_empty_outside_registration() {
+        unsafe {
+            assert_eq!(sekka_context_is_registering(ptr::null_mut()), 0);
+            assert!(sekka_context_get_registration_reading(ptr::null_mut()).is_null());
+            assert!(sekka_context_get_registration_prompt(ptr::null_mut()).is_null());
+
+            let ctx = sekka_context_new();
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(reg_reading_string(ctx), "");
+            assert_eq!(reg_prompt_string(ctx), "");
 
             sekka_context_free(ctx);
         }

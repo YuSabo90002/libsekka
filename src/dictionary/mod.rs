@@ -168,6 +168,22 @@ pub trait Dictionary {
         Err(DictError::ReadOnlyViolation)
     }
 
+    /// Moves a registered word to the head of its reading (D-182, Phase 10)
+    ///
+    /// Registration moves the word to the head of its reading: the new
+    /// frequency is the maximum frequency among that reading's
+    /// user-dictionary entries, plus one - for a brand new word and for
+    /// re-registering the same (reading, word) pair alike, never duplicating
+    /// (REG-06). A separate operation from `record_selection`'s plain +1 (a
+    /// future switch from frequency-count learning to MRU, todo
+    /// 2026-09-28-switch-learning-to-mru, is expected to replace ordinary
+    /// learning with this same operation). The default implementation
+    /// refuses read-only dictionaries (the master dictionary); only writable
+    /// dictionaries (`UserDict`) override it.
+    fn record_registration(&self, _reading: &str, _word: &str) -> Result<(), DictError> {
+        Err(DictError::ReadOnlyViolation)
+    }
+
     /// Flushes the dictionary's pending changes to disk (D-102)
     ///
     /// The default implementation does nothing for read-only dictionaries (it
@@ -271,5 +287,26 @@ mod tests {
         assert_eq!(entry.word, "東京");
         assert_eq!(entry.annotation, Some("地名".to_string()));
         assert_eq!(entry.frequency, 100);
+    }
+
+    /// D-182: the master dictionary (read-only, immutable format) refuses
+    /// `record_registration` through the trait's default implementation.
+    #[test]
+    fn read_only_dictionaries_refuse_record_registration() {
+        use crate::dictionary::immutable_dict::ImmutableFileDict;
+        use std::collections::BTreeMap;
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test.dict");
+        let entries: BTreeMap<String, Vec<DictEntry>> = BTreeMap::new();
+        dict_format::write_dict(&path, &entries).expect("write_dict failed");
+
+        let dict = ImmutableFileDict::open(&path).expect("failed to open the dictionary");
+        let result = dict.record_registration("せっか", "石火");
+        assert!(
+            matches!(result, Err(DictError::ReadOnlyViolation)),
+            "a read-only dictionary should refuse record_registration: {:?}",
+            result
+        );
     }
 }
