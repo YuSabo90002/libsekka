@@ -423,6 +423,12 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
 /// recursive entry). Alt/Super always forward (D-177: "Alt＋キーも、登録中は
 /// 何もしない"), checked first so it takes priority even inside the
 /// candidate window.
+///
+/// Since Alt-only printable keys stopped being forwarded outside registration
+/// (D-185, Phase 11: they now commit the character without Alt instead), the
+/// answer for Alt/Super here reads as "do nothing while registering" more than
+/// "would be forwarded outside registration". Registration still swallows them
+/// here as before: D-185's table row for registration is D-177 unchanged.
 fn would_forward_outside_registration(active: &SekkaContext, keysym: u32, modifiers: u32) -> bool {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
