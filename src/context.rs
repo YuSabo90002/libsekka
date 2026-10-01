@@ -697,7 +697,9 @@ impl SekkaContext {
     /// Checked with `is_some()` first (an immutable borrow) so the recursive
     /// call below can take a fresh mutable borrow of `session.inner` - NLL
     /// accepts this shape where borrowing `self.registration` as `&mut`
-    /// directly inside the `if let` would not.
+    /// directly inside the `if let` would not (so clippy's `if let`
+    /// suggestion does not compile here).
+    #[allow(clippy::unnecessary_unwrap)]
     pub fn active_mut(&mut self) -> &mut SekkaContext {
         if self.registration.is_some() {
             self.registration.as_mut().unwrap().inner.active_mut()
@@ -951,11 +953,8 @@ impl SekkaContext {
     /// innermost step's is (D-171). `None` outside registration.
     pub fn registration_word(&self) -> Option<String> {
         let mut current = self.registration.as_ref()?;
-        loop {
-            match current.inner.registration.as_ref() {
-                Some(inner_session) => current = inner_session,
-                None => break,
-            }
+        while let Some(inner_session) = current.inner.registration.as_ref() {
+            current = inner_session;
         }
         Some(format!("{}{}", current.draft, current.inner.get_preedit()))
     }
@@ -4914,8 +4913,8 @@ mod tests {
     /// Types `outer`, converts it with Ctrl-J, presses Ctrl-R, then types each
     /// string of `inner_steps` into the innermost step and (except the last,
     /// when `convert_last_step` is false - the D-176 raw-romaji path) converts
-    /// it with Ctrl-J too, calling `absorb_registration_output` after every key
-    /// - exactly the sequence capi drives, one absorb per key event. Finally
+    /// it with Ctrl-J too, calling `absorb_registration_output` after every
+    /// key, exactly the sequence capi drives (one absorb per key event). Finally
     /// calls `finish_registration` and returns `poll_output()`.
     fn register_word(
         ctx: &mut SekkaContext,

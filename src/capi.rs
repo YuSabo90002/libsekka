@@ -464,7 +464,7 @@ fn would_forward_outside_registration(active: &SekkaContext, keysym: u32, modifi
 ///    session itself in place. `q` needs no dedicated branch here: inside the
 ///    candidate window `route_key` already closes it, and outside it `q` is
 ///    simply ordinary romaji input.
-///  3. BackSpace: routed to the inner step first via `route_key` exactly like
+/// 3. BackSpace: routed to the inner step first via `route_key` exactly like
 ///    an ordinary key (closes the candidate window and/or reverts to the
 ///    original romaji, D-160/D-161, when there is something for it to act
 ///    on); when that leaves it unconsumed (the innermost step had nothing to
@@ -501,7 +501,9 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
     }
 
     // 2. Esc / Ctrl-G (D-174/D-179).
-    if (!ctrl && !other && keysym == 0xFF1B) || (ctrl && !other && ctrl_letter(keysym, b'g')) {
+    let esc = !ctrl && keysym == 0xFF1B;
+    let ctrl_g = ctrl && ctrl_letter(keysym, b'g');
+    if !other && (esc || ctrl_g) {
         if ctx.active().state() == ConversionState::Selecting {
             let mut discarded_forward = false;
             route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
