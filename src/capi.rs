@@ -943,6 +943,10 @@ pub unsafe extern "C" fn sekka_context_set_dictionaries(
 
 /// Returns the current number of candidates
 ///
+/// While registering (Phase 10, REG-02), follows the innermost step
+/// (`active()`) - the frozen outer step's own candidates (if any) are never
+/// visible during registration (D-170).
+///
 /// # Safety
 /// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
 #[no_mangle]
@@ -952,7 +956,7 @@ pub unsafe extern "C" fn sekka_context_get_candidate_count(ctx: *mut SekkaContex
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &*ctx };
-        ctx.ctx.get_candidates().len() as c_int
+        ctx.ctx.active().get_candidates().len() as c_int
     }))
     .unwrap_or(0)
 }
@@ -966,6 +970,10 @@ pub unsafe extern "C" fn sekka_context_get_candidate_count(ctx: *mut SekkaContex
 /// must pass this number straight to `sekka_free_candidate_list`. It means something
 /// different from `sekka_context_get_candidate_count` (the total number of
 /// candidates, which ignores `offset`/`max_count`).
+///
+/// While registering (Phase 10, REG-02), follows the innermost step
+/// (`active()`) - the frozen outer step's own candidates (if any) are never
+/// visible during registration (D-170).
 ///
 /// # Safety
 /// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
@@ -982,7 +990,7 @@ pub unsafe extern "C" fn sekka_context_get_candidates(
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &*ctx };
-        let cands = ctx.ctx.get_candidates();
+        let cands = ctx.ctx.active().get_candidates();
         let offset = offset as usize;
         let max_count = max_count as usize;
         let out = unsafe { slice::from_raw_parts_mut(candidates, max_count) };
@@ -1009,6 +1017,10 @@ pub unsafe extern "C" fn sekka_context_get_candidates(
 
 /// Selects the candidate at the given index
 ///
+/// While registering (Phase 10, REG-02), follows the innermost step
+/// (`active_mut()`) - selection during registration walks the innermost
+/// step's own candidate window, never the frozen outer step's.
+///
 /// # Safety
 /// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
 #[no_mangle]
@@ -1018,16 +1030,17 @@ pub unsafe extern "C" fn sekka_context_select_candidate(ctx: *mut SekkaContextFf
     }
     let _ = catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &mut *ctx };
+        let active = ctx.ctx.active_mut();
         // `next_candidate` / `prev_candidate` return without doing anything when
         // `state != Selecting`. Entering the loop below with a non-empty candidate
         // list while `state != Selecting` would therefore leave `candidate_index`
         // frozen forever and freeze all of fcitx5 (01.2-REVIEW WR-02). Unless this
         // invariant is written into the code, it will be hit the moment the C++ side
         // starts calling this function for click selection in the candidate window.
-        if ctx.ctx.state() != ConversionState::Selecting {
+        if active.state() != ConversionState::Selecting {
             return;
         }
-        let count = ctx.ctx.get_candidates().len() as i32;
+        let count = active.get_candidates().len() as i32;
         if index >= count {
             return;
         }
@@ -1035,11 +1048,11 @@ pub unsafe extern "C" fn sekka_context_select_candidate(ctx: *mut SekkaContextFf
         // and the start, so any target index is reached in at most `count` steps.
         // Even if the guard above is broken later, this loop always terminates.
         let mut steps_left = count;
-        while ctx.ctx.get_candidate_index() != index && steps_left > 0 {
-            if ctx.ctx.get_candidate_index() < index {
-                ctx.ctx.next_candidate();
+        while active.get_candidate_index() != index && steps_left > 0 {
+            if active.get_candidate_index() < index {
+                active.next_candidate();
             } else {
-                ctx.ctx.prev_candidate();
+                active.prev_candidate();
             }
             steps_left -= 1;
         }
@@ -1053,6 +1066,18 @@ pub unsafe extern "C" fn sekka_context_select_candidate(ctx: *mut SekkaContextFf
 /// state and then committed; in the commit display state it is committed as it is
 /// (delegated to `finalize_staged`).
 ///
+/// While registering (Phase 10, REG-02 / D-116 / D-173 / D-175), follows the
+/// innermost step: `finalize_staged()` runs on `active_mut()` instead of the
+/// outer context, so a click on an inner candidate (`SekkaCandidateList`'s
+/// `selectAt`, C++ side unmodified) goes into the word being assembled - the
+/// same "decide only" treatment as Ctrl-M (D-173) - and never reaches the
+/// application. `absorb_registration_output()` then pulls whatever that step
+/// just committed up into its parent's `draft`, exactly like every other
+/// registration-mode key event. Outside registration `absorb_registration_output`
+/// is a no-op, so this stays identical to the pre-Phase-10 behaviour. The
+/// explicit-reset (`SekkaState::reset(true)`) handling of D-181 is
+/// `sekka_context_finalize_for_reset` (a later plan) - not this function.
+///
 /// # Safety
 /// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
 #[no_mangle]
@@ -1062,13 +1087,17 @@ pub unsafe extern "C" fn sekka_context_confirm_candidate(ctx: *mut SekkaContextF
     }
     let _ = catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &mut *ctx };
-        ctx.ctx.finalize_staged();
+        ctx.ctx.active_mut().finalize_staged();
+        ctx.ctx.absorb_registration_output();
     }));
 }
 
 /// Gets the index of the selected candidate
 ///
 /// Returns -1 when nothing is selected, for a NULL pointer, or on panic.
+///
+/// While registering (Phase 10, REG-02), follows the innermost step
+/// (`active()`).
 ///
 /// # Safety
 /// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
@@ -1079,7 +1108,7 @@ pub unsafe extern "C" fn sekka_context_get_candidate_index(ctx: *mut SekkaContex
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &*ctx };
-        ctx.ctx.get_candidate_index()
+        ctx.ctx.active().get_candidate_index()
     }))
     .unwrap_or(-1)
 }
@@ -4155,6 +4184,162 @@ mod tests {
             assert_eq!(preedit_string(ctx), "");
 
             sekka_context_free(ctx);
+        }
+    }
+
+    // === REG-02 candidate delegation and Enter's 3 inner states (D-116/D-172/D-176, Phase 10) ===
+
+    /// REG-02 / D-116 / D-173: the candidate getters, `select_candidate` and
+    /// `confirm_candidate` all follow the innermost registration step. The
+    /// frozen outer step's own candidates are never visible while
+    /// registering, and a click-style confirm (the same call the C++ side's
+    /// `SekkaCandidateList::selectAt` makes) goes into the word being
+    /// assembled instead of the application.
+    #[test]
+    fn candidate_getters_follow_the_active_step_during_registration() {
+        unsafe {
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 4);
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+            assert_eq!(
+                sekka_context_get_candidate_count(ctx),
+                0,
+                "the frozen outer candidates must not be visible while registering"
+            );
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx); // stage き
+            sekka_context_trigger(ctx); // enter the inner candidate window
+
+            assert_eq!(sekka_context_get_candidate_count(ctx), 4);
+            let mut buf: [*mut c_char; 8] = [ptr::null_mut(); 8];
+            let count = sekka_context_get_candidates(ctx, buf.as_mut_ptr(), 8, 0);
+            assert!(count > 0);
+            assert_eq!(CStr::from_ptr(buf[0]).to_str().unwrap(), "き");
+            sekka_free_candidate_list(buf.as_mut_ptr(), count);
+            assert_eq!(sekka_context_get_candidate_index(ctx), 0);
+
+            sekka_context_select_candidate(ctx, 1);
+            assert_eq!(sekka_context_get_candidate_index(ctx), 1);
+            assert_eq!(preedit_string(ctx), "キ");
+
+            // The click path: select_candidate then confirm_candidate.
+            sekka_context_confirm_candidate(ctx);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            assert_eq!(preedit_string(ctx), "キ");
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-172: Enter from inside the inner candidate window registers
+    /// whichever candidate was selected there (キ, reached with one more
+    /// Ctrl-J than the first candidate き).
+    #[test]
+    fn enter_in_the_inner_window_registers_the_selected_candidate() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx); // stage き
+            sekka_context_trigger(ctx); // enter the inner candidate window
+            sekka_context_trigger(ctx); // advance to キ
+            assert_eq!(preedit_string(ctx), "キ");
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "キ");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-172: Enter from the inner commit display state (only one Ctrl-J -
+    /// no candidate window entered) registers the word shown there (き).
+    #[test]
+    fn enter_in_the_inner_commit_display_registers_the_shown_word() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx); // stage き
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "き");
+            sekka_free_string(output);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-176 / REG-07: Enter with unconverted romaji left in the inner step
+    /// registers the romaji as it is, and the registered word is found
+    /// through the same reading afterward (still in the same process).
+    #[test]
+    fn enter_with_unconverted_romaji_registers_the_romaji_as_is() {
+        unsafe {
+            let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+            let dict_path = tmp.path().join("test_user_dict");
+            let path_cstr =
+                CString::new(dict_path.to_str().unwrap()).expect("failed to build the CString");
+            let mut dict = sekka_user_dict_new(path_cstr.as_ptr(), ptr::null());
+            assert!(!dict.is_null());
+
+            let ctx = sekka_context_new();
+            sekka_context_set_dictionaries(ctx, &mut dict, 1);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+
+            for ch in "Linux".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            assert_eq!(preedit_string(ctx), "Linux");
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Linux");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            for ch in "Ka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            assert_eq!(
+                preedit_string(ctx),
+                "Linux",
+                "REG-07: the registered word should be the first candidate under か"
+            );
+
+            sekka_context_free(ctx);
+            sekka_free_dictionary(dict);
         }
     }
 }
