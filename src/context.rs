@@ -473,6 +473,24 @@ impl SekkaContext {
         }
     }
 
+    /// Commits whatever this key event commits and appends `ch`, even when there is
+    /// nothing else to commit (D-185, Phase 11)
+    ///
+    /// The Alt-stripped character of a printable key held with Alt alone is always
+    /// committed: appended to whatever this key event commits (the romaji buffer, or
+    /// the commit-display word the caller's D-12 flush already produced, like
+    /// `commit_with_trailing_char`), or committed alone when there is nothing else.
+    /// Unlike D-158, it is consumed even then, because leaving it unconsumed would
+    /// hand the application the Alt-modified key. D-12 learning is unchanged: the
+    /// flush goes through `flush_last_commit` as before.
+    pub fn commit_alt_passthrough_char(&mut self, ch: char) {
+        self.commit_raw_romaji();
+        match &mut self.committed_output {
+            Some(text) => text.push(ch),
+            None => self.committed_output = Some(ch.to_string()),
+        }
+    }
+
     /// Reverts to the original romaji on BackSpace, or edits the romaji buffer
     /// (D-160/D-161, Phase 9)
     ///
@@ -3607,6 +3625,37 @@ mod tests {
         // (c) Nothing to commit: returns false and produces no output.
         let mut ctx = SekkaContext::new();
         assert!(!ctx.commit_with_trailing_char('+'));
+        assert!(ctx.poll_output().is_none());
+    }
+
+    #[test]
+    fn commit_alt_passthrough_char_commits_even_with_nothing_else_to_commit() {
+        // D-185. Same three shapes as the D-158 test above, but the character is
+        // committed even when there is nothing else to commit.
+
+        // (a) An empty context: the character is committed alone.
+        let mut ctx = SekkaContext::new();
+        ctx.commit_alt_passthrough_char('d');
+        assert_eq!(ctx.poll_output(), Some("d".to_string()));
+        assert!(ctx.poll_output().is_none());
+
+        // (b) A romaji buffer ("Kanj") gets the character appended and is cleared.
+        let mut ctx = SekkaContext::new();
+        for ch in "Kanj".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.commit_alt_passthrough_char('d');
+        assert_eq!(ctx.poll_output(), Some("Kanjd".to_string()));
+        assert_eq!(ctx.get_preedit(), "");
+
+        // (c) The commit-display word ("あ"), already flushed by the caller, gets the
+        // character appended; the flush itself is unchanged.
+        let mut ctx = SekkaContext::new();
+        ctx.process_key('a', false);
+        ctx.process_key('\0', true);
+        assert!(ctx.flush_last_commit());
+        ctx.commit_alt_passthrough_char('d');
+        assert_eq!(ctx.poll_output(), Some("あd".to_string()));
         assert!(ctx.poll_output().is_none());
     }
 

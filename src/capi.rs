@@ -282,6 +282,7 @@ fn dispatch_input(
 ) -> c_int {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+    let alt_only = (modifiers & MOD_ALT) != 0 && !ctrl && (modifiers & MOD_SUPER) == 0;
 
     if ctrl && !other && ctrl_letter(keysym, b'r') && ctx.has_staged_candidate() {
         ctx.begin_registration();
@@ -323,10 +324,25 @@ fn dispatch_input(
         };
     }
 
+    // D-185/D-186 (Phase 11): a printable ASCII key (the same 0x20..=0x7E range as
+    // D-158) held with Alt but neither Ctrl nor Super is committed as text with Alt
+    // removed, the only way to strip a modifier under fcitx5's Wayland frontend
+    // (D-184: a forwarded key carries the physically held modifiers). Shift is
+    // already applied to the keysym (D-186); fcitx5-sekka passes the unnormalized
+    // keysym for these keys. It is committed even when there is nothing else to
+    // commit, and the forward flag is left alone so the committed character and the
+    // key are never both delivered (D-155). D-187/D-188 keep a non-printable key
+    // with Alt, and any key with Ctrl or Super, on the D-03/D-162 path below.
+    if alt_only && is_printable_ascii(keysym) {
+        ctx.commit_alt_passthrough_char(keysym as u8 as char);
+        return 1;
+    }
+
     // Anything else (non-character keys, including keys with Ctrl/Alt/Super):
     // commit the romaji as it is and forward the key too (D-03). Since D-158
     // (Phase 9), the only keys that reach this branch are non-printable keys and
-    // Ctrl/Alt/Super-modified keys (D-166: history kept, not erased).
+    // Ctrl/Super-modified keys, plus Alt-modified non-printable keys (D-166:
+    // history kept, not erased; D-185 moved Alt-only printable keys above).
     if ctx.commit_raw_romaji() {
         *forward_key = true;
         return 1;
@@ -624,6 +640,10 @@ pub extern "C" fn sekka_get_version() -> *const c_char {
 /// # Arguments
 /// * `ctx` - pointer to the input context
 /// * `keysym` - the X11 key symbol value
+///   For a key held with Alt but neither Ctrl nor Super, the caller (fcitx5-sekka)
+///   passes the unnormalized keysym (`KeyEvent::rawKey()`), so `Alt+d` arrives as `d`
+///   and `Alt+Shift+d` as `D` (D-185/D-186). Every other key is normalized, and a
+///   letter held with Ctrl arrives uppercase (`ctrl_letter`).
 /// * `modifiers` - the modifier key bitmask
 /// * `is_release` - non-zero for a key release
 ///
@@ -1820,14 +1840,15 @@ mod tests {
     }
 
     #[test]
-    fn a_printable_symbol_with_ctrl_alt_or_super_commits_and_forwards() {
-        // D-162: Ctrl/Alt/Super-modified printable keys are excluded from D-158
-        // (the `!ctrl && !other` guard on the is_printable_ascii branch in
-        // dispatch_input) and keep the D-03 commit-and-forward behavior, like any
-        // other modified key. Each case uses a fresh context with "k" already in
-        // the buffer.
+    fn a_printable_symbol_with_ctrl_or_super_commits_and_forwards_even_with_alt() {
+        // D-162/D-188: printable keys held with Ctrl or Super (Alt or not) are
+        // excluded from D-158 and from D-185's Alt passthrough (`alt_only` is false
+        // as soon as Ctrl or Super is held) and keep the D-03 commit-and-forward
+        // behavior, like any other modified key. Until Phase 11 a lone Alt was in this
+        // list too (see the test below). Each case uses a fresh context with "k"
+        // already in the buffer.
         unsafe {
-            for modifiers in [MOD_CTRL, MOD_ALT, MOD_SUPER] {
+            for modifiers in [MOD_CTRL, MOD_SUPER, MOD_CTRL | MOD_ALT, MOD_SUPER | MOD_ALT] {
                 let ctx = sekka_context_new();
                 sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
 
@@ -1853,6 +1874,52 @@ mod tests {
 
                 sekka_context_free(ctx);
             }
+        }
+    }
+
+    #[test]
+    fn a_printable_symbol_with_alt_alone_is_appended_without_alt_and_not_forwarded() {
+        // D-185: a printable key held with Alt alone is appended to whatever this key
+        // event commits and is not forwarded (the Alt is stripped by committing it as
+        // text). Phase 11 and earlier committed "k" and forwarded the key (D-162).
+        unsafe {
+            let ctx = sekka_context_new();
+            sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0x2B, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "k+");
+            sekka_free_string(output);
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn an_alt_printable_key_with_nothing_to_commit_is_consumed_and_committed_alone() {
+        // D-185 (table row 1): unlike D-158 (a plain printable key with nothing to
+        // commit stays unconsumed), an Alt-held printable key is consumed even then:
+        // leaving it unconsumed would hand the application the Alt-modified key.
+        unsafe {
+            let ctx = sekka_context_new();
+
+            let consumed = sekka_context_process_key_event(ctx, b'd' as u32, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "d");
+            sekka_free_string(output);
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
+
+            sekka_context_free(ctx);
         }
     }
 
@@ -2009,17 +2076,13 @@ mod tests {
     }
 
     #[test]
-    fn alt_or_super_keys_are_non_character_keys() {
+    fn super_keys_are_non_character_keys() {
+        // D-188: a key held with Super stays a non-character key (commit the romaji
+        // and forward). The Alt half of this test moved to
+        // `an_alt_letter_during_input_is_appended_without_alt_and_not_forwarded`
+        // (D-185); Phase 11 and earlier committed and forwarded Alt keys too (D-162).
         unsafe {
             let ctx = sekka_context_new();
-
-            sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
-            let consumed = sekka_context_process_key_event(ctx, b'f' as u32, 0x8, 0);
-            assert_eq!(consumed, 1);
-            let output = sekka_context_poll_output(ctx);
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "k");
-            sekka_free_string(output);
-            assert_eq!(sekka_context_take_forward_key(ctx), 1);
 
             sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
             let consumed = sekka_context_process_key_event(ctx, b'f' as u32, 0x40, 0);
@@ -2028,6 +2091,33 @@ mod tests {
             assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "k");
             sekka_free_string(output);
             assert_eq!(sekka_context_take_forward_key(ctx), 1);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn an_alt_letter_during_input_is_appended_without_alt_and_not_forwarded() {
+        // D-185 (table row 2): during romaji input, an Alt-held letter is appended to
+        // the romaji as it stands (D-03: not converted) and committed in one go;
+        // nothing is forwarded. fcitx5-sekka passes the unnormalized (lowercase)
+        // keysym for Alt-only keys.
+        unsafe {
+            let ctx = sekka_context_new();
+
+            for ch in [b'K', b'a', b'n', b'j'] {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            let consumed = sekka_context_process_key_event(ctx, b'd' as u32, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Kanjd");
+            sekka_free_string(output);
+
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
 
             sekka_context_free(ctx);
         }
@@ -2642,20 +2732,27 @@ mod tests {
     }
 
     #[test]
-    fn an_alt_key_in_selection_mode_is_an_other_key() {
+    fn an_alt_key_in_selection_mode_confirms_and_is_appended_without_alt() {
+        // D-185 (table row 4): in the candidate window an Alt-held printable key is
+        // not matched against D-09's table (`handle_selecting_key` treats Alt as an
+        // other key, even for the next-candidate `n`), so it confirms the selected
+        // candidate and is appended to it, without forwarding. Until Phase 11 an
+        // Alt key here confirmed and was forwarded (D-162).
         unsafe {
             let ctx = sekka_context_new();
             reselection_is_entered_for_ka_without_a_dictionary(ctx);
 
-            let consumed = sekka_context_process_key_event(ctx, b'n' as u32, 0x8, 0);
+            let consumed = sekka_context_process_key_event(ctx, b'n' as u32, MOD_ALT, 0);
             assert_eq!(consumed, 1);
 
             let output = sekka_context_poll_output(ctx);
             assert!(!output.is_null());
-            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か");
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "かn");
             sekka_free_string(output);
 
-            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
 
             sekka_context_free(ctx);
         }
