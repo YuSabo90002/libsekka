@@ -1943,6 +1943,149 @@ mod tests {
     }
 
     #[test]
+    fn alt_shift_keys_arrive_with_shift_applied_and_are_committed_as_is() {
+        // D-186 (S1): fcitx5 delivers Alt+Shift+d as keysym 'D' and Alt+Shift+; as
+        // keysym ':' (Shift is already applied to the keysym, and Sekka does not pass
+        // Shift to libsekka), so the Alt branch commits exactly that character. Digits
+        // and ':' are romaji characters, but with Alt held they never reach the romaji
+        // buffer: they are committed as text.
+        unsafe {
+            for (keysym, expected) in [(b'D' as u32, "D"), (b':' as u32, ":"), (b'3' as u32, "3")] {
+                let ctx = sekka_context_new();
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    expected,
+                    "keysym={:#x}",
+                    keysym
+                );
+                sekka_free_string(output);
+
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert_eq!(preedit_string(ctx), "", "keysym={:#x}", keysym);
+
+                sekka_context_free(ctx);
+            }
+
+            // During romaji input the character is joined to the buffer in one commit.
+            let ctx = sekka_context_new();
+            sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, b':' as u32, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "k:");
+            sekka_free_string(output);
+            assert!(
+                sekka_context_poll_output(ctx).is_null(),
+                "a single commit only"
+            );
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn alt_printable_ascii_boundaries_decide_between_committing_and_forwarding() {
+        // D-186 (Claude's Discretion): the printable range with Alt held is the same as
+        // D-158's (0x20..=0x7E; Latin-1 such as 0xA5 is not included). Inside the range
+        // the character is committed without Alt and not forwarded; outside it the key
+        // is a non-character key (D-187): commit and forward when there is something to
+        // commit, unconsumed when there is not. Each case uses a fresh context.
+        unsafe {
+            // With "k" in the buffer.
+            for (keysym, expected_output, expected_forward) in [
+                (0x1Fu32, "k", 1),
+                (0x20, "k ", 0),
+                (0x7E, "k~", 0),
+                (0x7F, "k", 1),
+                (0xA5, "k", 1),
+            ] {
+                let ctx = sekka_context_new();
+                sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    expected_output,
+                    "keysym={:#x}",
+                    keysym
+                );
+                sekka_free_string(output);
+
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    expected_forward,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+
+            // With nothing in the buffer: the range is consumed and committed alone,
+            // everything else stays unconsumed.
+            for (keysym, expected_output) in [
+                (0x20u32, Some(" ")),
+                (0x7E, Some("~")),
+                (0x1F, None),
+                (0x7F, None),
+                (0xA5, None),
+            ] {
+                let ctx = sekka_context_new();
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(
+                    consumed,
+                    if expected_output.is_some() { 1 } else { 0 },
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                let output = sekka_context_poll_output(ctx);
+                match expected_output {
+                    Some(expected) => {
+                        assert!(!output.is_null(), "keysym={:#x}", keysym);
+                        assert_eq!(
+                            CStr::from_ptr(output).to_str().unwrap(),
+                            expected,
+                            "keysym={:#x}",
+                            keysym
+                        );
+                        sekka_free_string(output);
+                    }
+                    None => assert!(output.is_null(), "keysym={:#x}", keysym),
+                }
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
     fn the_long_vowel_mark_accumulates_as_romaji() {
         unsafe {
             let ctx = sekka_context_new();
