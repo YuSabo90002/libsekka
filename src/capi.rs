@@ -2086,6 +2086,164 @@ mod tests {
     }
 
     #[test]
+    fn alt_with_a_non_printable_key_commits_and_forwards_as_before() {
+        // D-187 (N1): Alt with a key that is not a printable character (Enter, Esc,
+        // BackSpace, Tab, Right, F1) is still a non-character key (D-162, unchanged):
+        // the romaji is committed and the key is forwarded with Alt kept. Alt+BackSpace
+        // does not delete a romaji character first: the BackSpace branch requires no
+        // other modifier, so it falls through to commit-and-forward.
+        unsafe {
+            for keysym in [0xFF0Du32, 0xFF1B, 0xFF08, 0xFF09, 0xFF53, 0xFFBE] {
+                let ctx = sekka_context_new();
+                for ch in "Kanj".bytes() {
+                    sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+                }
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(
+                    CStr::from_ptr(output).to_str().unwrap(),
+                    "Kanj",
+                    "keysym={:#x}",
+                    keysym
+                );
+                sekka_free_string(output);
+
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    1,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn alt_with_a_non_printable_key_and_nothing_to_commit_is_not_consumed() {
+        // D-187 (N1, unchanged D-162): with nothing to commit, Alt with a non-printable
+        // key is left to the application: unconsumed, no commit, no forward request.
+        unsafe {
+            for keysym in [0xFF0Du32, 0xFF1B, 0xFF08, 0xFF09, 0xFF53, 0xFFBE] {
+                let ctx = sekka_context_new();
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, MOD_ALT, 0);
+                assert_eq!(consumed, 0, "keysym={:#x}", keysym);
+
+                assert!(
+                    sekka_context_poll_output(ctx).is_null(),
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_or_super_with_alt_and_nothing_to_commit_is_not_consumed() {
+        // D-188: Alt never gets stripped from a Ctrl+Alt / Super+Alt shortcut. With
+        // nothing to commit the key is unconsumed (D-162, unchanged), for both the
+        // lowercase and the uppercase keysym.
+        unsafe {
+            for modifiers in [
+                MOD_CTRL | MOD_ALT,
+                MOD_SUPER | MOD_ALT,
+                MOD_CTRL | MOD_SUPER | MOD_ALT,
+            ] {
+                for keysym in [b'd' as u32, b'D' as u32] {
+                    let ctx = sekka_context_new();
+
+                    let consumed = sekka_context_process_key_event(ctx, keysym, modifiers, 0);
+                    assert_eq!(
+                        consumed, 0,
+                        "keysym={:#x} modifiers={:#x}",
+                        keysym, modifiers
+                    );
+
+                    assert!(
+                        sekka_context_poll_output(ctx).is_null(),
+                        "keysym={:#x} modifiers={:#x}",
+                        keysym,
+                        modifiers
+                    );
+                    assert_eq!(
+                        sekka_context_take_forward_key(ctx),
+                        0,
+                        "keysym={:#x} modifiers={:#x}",
+                        keysym,
+                        modifiers
+                    );
+
+                    sekka_context_free(ctx);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ctrl_or_super_with_alt_commits_and_forwards_in_the_commit_display_state_and_selection_mode()
+    {
+        // D-188 / D-187 (D-162, unchanged): in the commit display state and in the
+        // candidate window, Ctrl+Alt / Super+Alt keys confirm what is shown and are
+        // forwarded with their modifiers; Alt+Enter is not D-09's confirm key either,
+        // so it confirms the selected candidate and is forwarded.
+        unsafe {
+            // (a) Commit display state: Ctrl+Alt+D commits 「か」 and forwards.
+            let ctx = make_commit_display_state();
+            let consumed = sekka_context_process_key_event(ctx, b'D' as u32, MOD_CTRL | MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            sekka_context_free(ctx);
+
+            // (b) Candidate window: Super+Alt+d confirms the selected カ and forwards.
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            sekka_context_process_key_event(ctx, b'j' as u32, 0x4, 0);
+            let consumed =
+                sekka_context_process_key_event(ctx, b'd' as u32, MOD_SUPER | MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "カ");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            sekka_context_free(ctx);
+
+            // (c) Candidate window: Alt+Enter confirms the selected カ and forwards.
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            sekka_context_process_key_event(ctx, b'j' as u32, 0x4, 0);
+            let consumed = sekka_context_process_key_event(ctx, 0xFF0D, MOD_ALT, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "カ");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
     fn the_long_vowel_mark_accumulates_as_romaji() {
         unsafe {
             let ctx = sekka_context_new();
