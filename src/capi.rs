@@ -199,6 +199,37 @@ fn handle_selecting_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) -> 
     false
 }
 
+/// Mirrors the key table `handle_selecting_key` consumes (D-177)
+///
+/// A copy of the D-09 table above (including D-161's BackSpace and D-167's
+/// Ctrl-R) as a pure predicate with no `SekkaContext` side effects, so
+/// `would_forward_outside_registration` can ask "is this one of the keys the
+/// candidate window itself handles" without calling into the context. Kept
+/// in step with `handle_selecting_key` by the exhaustive agreement test
+/// `selecting_table_predicate_agrees_with_handle_selecting_key`.
+fn is_selecting_table_key(keysym: u32, modifiers: u32) -> bool {
+    let ctrl = (modifiers & MOD_CTRL) != 0;
+    let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+    if other {
+        return false;
+    }
+    if ctrl {
+        return ctrl_letter(keysym, b'j')
+            || ctrl_letter(keysym, b'n')
+            || ctrl_letter(keysym, b'p')
+            || ctrl_letter(keysym, b'm')
+            || ctrl_letter(keysym, b'g')
+            || ctrl_letter(keysym, b'a')
+            || ctrl_letter(keysym, b'u')
+            || ctrl_letter(keysym, b'i')
+            || ctrl_letter(keysym, b'k')
+            || ctrl_letter(keysym, b'l')
+            || ctrl_letter(keysym, b'e')
+            || ctrl_letter(keysym, b'r');
+    }
+    matches!(keysym, 0xFF08 | 0x20 | 0xFF0D | 0xFF8D | 0xFF1B) || keysym == b'q' as u32
+}
+
 /// Key dispatch during input (the Input state) (D-03/D-12/D-13; D-160 replaces
 /// D-13's BackSpace rule, Phase 9)
 ///
@@ -341,35 +372,94 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
     dispatch_input(ctx, forward_key, keysym, modifiers)
 }
 
-/// Dispatches a key event while registering (D-172/D-174/D-176/REG-02, Phase 10)
+/// Whether, outside registration, this key would reach `dispatch_input`'s
+/// "Anything else" branch and be committed and forwarded to the application
+/// in the active step's current state (D-177)
 ///
-/// An Enter with no modifier finishes the current registration step
-/// (`finish_registration`, D-172/D-176). An unmodified Esc or Ctrl-G cancels
-/// the step (D-174) - unless the innermost step's own candidate window is
-/// open, in which case they only close that window, exactly like outside
-/// registration (D-09): the key is routed through `route_key` first so
-/// `handle_selecting_key`'s own Esc/Ctrl-G/q entries close the window,
-/// leaving the registration session itself in place. `q` needs no dedicated
-/// branch here: inside the candidate window `route_key` already closes it
-/// (D-09's table), and outside it `q` is simply ordinary romaji input
-/// (D-174). Every other key is routed to the innermost step's context via
-/// `route_key`, exactly like an ordinary key event, except that its
-/// forward-key result is always discarded - nothing typed while registering
-/// is ever forwarded to the application (REG-02; what would normally be
-/// forwarded, such as Ctrl/Alt/Super-modified keys or Enter itself outside
-/// registration, simply has no effect here beyond whatever `route_key`
-/// already did to the inner context). The caller is responsible for calling
-/// `ctx.absorb_registration_output()` afterward (REG-02: pulling any newly
-/// committed inner output up into `draft` is a separate step, shared with
-/// the trigger path).
+/// Covers Tab, the arrow keys, Home, End, Delete, the F keys, Ctrl + a
+/// letter not in the D-09 table, Ctrl-R with nothing staged, and every
+/// Alt/Super-modified key - the keys that, outside registration, `dispatch_input`
+/// or `handle_selecting_key`'s own miss-and-fall-through would ultimately
+/// commit and forward. `false` for every key `handle_registration_key`
+/// should still route to the inner step: BackSpace and printable ASCII
+/// (handled by their own dedicated branches below, D-158/D-175), the D-09
+/// table while `active` is in the Selecting state (so the candidate window
+/// keeps working, D-178), and Ctrl-R while a candidate is staged (D-171's
+/// recursive entry). Alt/Super always forward (D-177: "Alt＋キーも、登録中は
+/// 何もしない"), checked first so it takes priority even inside the
+/// candidate window.
+fn would_forward_outside_registration(active: &SekkaContext, keysym: u32, modifiers: u32) -> bool {
+    let ctrl = (modifiers & MOD_CTRL) != 0;
+    let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+    if other {
+        return true;
+    }
+    if active.state() == ConversionState::Selecting && is_selecting_table_key(keysym, modifiers) {
+        return false;
+    }
+    if ctrl {
+        return !(ctrl_letter(keysym, b'r') && active.has_staged_candidate());
+    }
+    if keysym == 0xFF08 || is_printable_ascii(keysym) {
+        return false;
+    }
+    true
+}
+
+/// Dispatches a key event while registering (D-172/D-173/D-174/D-175/D-176/
+/// D-177/D-178/REG-02, Phase 10)
+///
+/// The final form of the registration-mode key table (D-178), evaluated in
+/// this order - each branch calls `ctx.absorb_registration_output()` before
+/// returning, pulling any newly committed inner output up into `draft`
+/// (REG-02) even on an early return, so the caller never has to remember to
+/// call it separately:
+/// 1. Enter/KP_Enter with no modifier finishes the current registration step
+///    (`finish_registration`, D-172/D-176).
+/// 2. An unmodified Esc or Ctrl-G cancels the step (D-174) - unless the
+///    innermost step's own candidate window is open, in which case they only
+///    close that window (routed through `route_key` so `handle_selecting_key`'s
+///    own Esc/Ctrl-G/q entries handle it, D-09), leaving the registration
+///    session itself in place. `q` needs no dedicated branch here: inside the
+///    candidate window `route_key` already closes it, and outside it `q` is
+///    simply ordinary romaji input.
+///  3. BackSpace: routed to the inner step first via `route_key` exactly like
+///    an ordinary key (closes the candidate window and/or reverts to the
+///    original romaji, D-160/D-161, when there is something for it to act
+///    on); when that leaves it unconsumed (the innermost step had nothing to
+///    delete), the last character of the word being assembled is deleted
+///    instead (`pop_registration_draft`, D-175) - and when the word is empty
+///    too, this is simply a no-op (the reading is never touched and nothing
+///    is forwarded).
+/// 4. A key that `would_forward_outside_registration` says would reach the
+///    application outside registration is consumed and changes nothing at
+///    all (D-177) - not even routed to the inner step, so the candidate that
+///    may be staged there (commit display or the candidate window) is left
+///    exactly as it was.
+/// 5. Everything else is routed to the inner step's context via `route_key`,
+///    exactly like an ordinary key event. When that leaves it unconsumed and
+///    the key is a printable ASCII character with no modifier, it is
+///    appended to the word instead (`push_registration_draft`, D-177/D-158) -
+///    even when the innermost step's own buffer is empty, matching what
+///    `commit_with_trailing_char` does outside registration.
+///
+/// In branches 3 and 5, `route_key`'s own forward-key output parameter is
+/// always discarded after asserting it stayed `false`: nothing typed while
+/// registering is ever forwarded to the application (REG-02), and branch 4
+/// already stops every key that would have set it before `route_key` is ever
+/// called, so it can never actually become `true` here.
 fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
+
+    // 1. Enter / KP_Enter (D-172/D-176).
     if !ctrl && !other && (keysym == 0xFF0D || keysym == 0xFF8D) {
         ctx.finish_registration();
+        ctx.absorb_registration_output();
         return;
     }
 
+    // 2. Esc / Ctrl-G (D-174/D-179).
     if (!ctrl && !other && keysym == 0xFF1B) || (ctrl && !other && ctrl_letter(keysym, b'g')) {
         if ctx.active().state() == ConversionState::Selecting {
             let mut discarded_forward = false;
@@ -377,11 +467,38 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
         } else {
             ctx.cancel_registration();
         }
+        ctx.absorb_registration_output();
         return;
     }
 
+    // 3. BackSpace (D-175).
+    if !ctrl && !other && keysym == 0xFF08 {
+        let mut discarded_forward = false;
+        let consumed = route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+        debug_assert!(!discarded_forward);
+        if consumed == 0 {
+            ctx.pop_registration_draft();
+        }
+        ctx.absorb_registration_output();
+        return;
+    }
+
+    // 4. Keys that would reach the application outside registration (D-177):
+    // consumed without touching the inner step at all.
+    if would_forward_outside_registration(ctx.active(), keysym, modifiers) {
+        ctx.absorb_registration_output();
+        return;
+    }
+
+    // 5. Everything else -> the inner step; a printable-ASCII miss appends
+    // to the word instead (D-177/D-158).
     let mut discarded_forward = false;
-    route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+    let consumed = route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+    debug_assert!(!discarded_forward);
+    if consumed == 0 && !ctrl && !other && is_printable_ascii(keysym) {
+        ctx.push_registration_draft(keysym as u8 as char);
+    }
+    ctx.absorb_registration_output();
 }
 
 // ---------------------------------------------------------------------------
@@ -546,11 +663,11 @@ pub unsafe extern "C" fn sekka_context_process_key_event(
         // Phase 10: while registering, every key is consumed by the
         // registration mode itself (REG-02 - nothing is ever forwarded to the
         // application from here). `handle_registration_key` routes to the
-        // innermost step's context; `absorb_registration_output` then pulls
-        // whatever that step just committed up into its parent's draft.
+        // innermost step's context and calls `absorb_registration_output`
+        // itself before returning (D-178), pulling whatever that step just
+        // committed up into its parent's draft.
         if ctx.ctx.is_registering() {
             handle_registration_key(&mut ctx.ctx, keysym, modifiers);
-            ctx.ctx.absorb_registration_output();
             return 1;
         }
 
@@ -4340,6 +4457,400 @@ mod tests {
 
             sekka_context_free(ctx);
             sekka_free_dictionary(dict);
+        }
+    }
+
+    // === D-173/D-175/D-177/D-178 final key table, D-171 recursion (Phase 10, 10-03) ===
+
+    /// D-175/D-160: BackSpace during registration first edits the innermost
+    /// step exactly as it would outside registration (reverting the staged
+    /// candidate to its original romaji, then editing the romaji buffer);
+    /// once that step is exhausted, BackSpace deletes the last character of
+    /// the word being assembled instead; once the word is empty too,
+    /// BackSpace is consumed and changes nothing at all - the reading is
+    /// never touched and nothing is forwarded.
+    #[test]
+    fn backspace_in_registration_edits_the_inner_step_then_the_word() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "き");
+
+            let bs = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(bs, 1);
+            assert_eq!(preedit_string(ctx), "K");
+
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "き");
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            assert_eq!(preedit_string(ctx), "きKa");
+
+            for expected in ["きK", "き", ""] {
+                let bs = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+                assert_eq!(bs, 1, "expected={expected}");
+                assert_eq!(preedit_string(ctx), expected, "expected={expected}");
+                assert!(
+                    sekka_context_poll_output(ctx).is_null(),
+                    "expected={expected}"
+                );
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "expected={expected}"
+                );
+            }
+
+            // The word is now empty too: BackSpace is consumed and changes
+            // nothing at all (D-175 - the reading is never touched, nothing
+            // is forwarded).
+            let bs = sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(bs, 1);
+            assert_eq!(preedit_string(ctx), "");
+            assert_eq!(reg_reading_string(ctx), "か");
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert!(sekka_context_poll_output(ctx).is_null());
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-177: keys that would reach the application outside registration
+    /// (Tab, arrows, Home, End, Delete, F keys, Ctrl + a letter not in the
+    /// D-09 table, and every Alt/Super-modified key) are consumed and
+    /// change nothing during registration - not even the innermost step's
+    /// own staged candidate, which stays uncommitted throughout.
+    #[test]
+    fn keys_forwarded_outside_registration_do_nothing_during_registration() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "き");
+
+            for (keysym, modifiers) in [
+                (0xFF09u32, 0u32),      // Tab
+                (0xFF53u32, 0u32),      // Right
+                (0xFF50u32, 0u32),      // Home
+                (0xFF57u32, 0u32),      // End
+                (0xFFFFu32, 0u32),      // Delete
+                (0xFFBEu32, 0u32),      // F1
+                (b'b' as u32, 0x4u32),  // Ctrl-B, not in the D-09 table
+                (b'm' as u32, 0x4u32),  // Ctrl-M, outside the candidate window
+                (b'a' as u32, 0x8u32),  // Alt-a
+                (b'a' as u32, 0x40u32), // Super-a
+            ] {
+                let consumed = sekka_context_process_key_event(ctx, keysym, modifiers, 0);
+                assert_eq!(
+                    consumed, 1,
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym, modifiers
+                );
+                assert!(
+                    sekka_context_poll_output(ctx).is_null(),
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym,
+                    modifiers
+                );
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym,
+                    modifiers
+                );
+                assert_eq!(
+                    sekka_context_is_registering(ctx),
+                    1,
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym,
+                    modifiers
+                );
+                assert_eq!(
+                    preedit_string(ctx),
+                    "き",
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym,
+                    modifiers
+                );
+                assert!(
+                    (&*ctx).ctx.active().has_staged_candidate(),
+                    "the inner step's staged candidate must not be committed: keysym={:#x} modifiers={:#x}",
+                    keysym,
+                    modifiers
+                );
+            }
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            assert_eq!(preedit_string(ctx), "きK");
+
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(
+                (&*ctx).ctx.active().get_preedit(),
+                "K",
+                "the romaji buffer must not have been converted"
+            );
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-177/D-158: printable symbols (not romaji characters) during
+    /// registration are appended to the word - even when the innermost
+    /// step's own buffer is empty, matching what `commit_with_trailing_char`
+    /// does outside registration - and never forwarded.
+    #[test]
+    fn printable_symbols_during_registration_go_into_the_word() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+
+            for (keysym, expected) in [(0x2Bu32, "き+"), (0x2B, "き++"), (0x20, "き++ ")] {
+                let consumed = sekka_context_process_key_event(ctx, keysym, 0, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+                assert_eq!(preedit_string(ctx), expected, "keysym={:#x}", keysym);
+                assert!(
+                    sekka_context_poll_output(ctx).is_null(),
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+            }
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "き++ ");
+            sekka_free_string(output);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-173: Ctrl-M inside the innermost step's candidate window only
+    /// confirms the selected candidate exactly like D-09's own table (no
+    /// special case for registration) - it does not register or commit
+    /// anything by itself; a later Enter still registers whatever is now
+    /// shown.
+    #[test]
+    fn ctrl_m_in_the_inner_window_only_confirms() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx); // stage き
+            sekka_context_trigger(ctx); // enter the inner candidate window
+            sekka_context_trigger(ctx); // advance to キ
+            assert_eq!(preedit_string(ctx), "キ");
+
+            let consumed = sekka_context_process_key_event(ctx, b'm' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            assert_eq!(preedit_string(ctx), "キ");
+            assert!(sekka_context_poll_output(ctx).is_null());
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "キ");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// Exhaustive agreement test (D-177): for every keysym/modifier
+    /// combination in the sweep, `is_selecting_table_key` agrees with
+    /// whether `handle_selecting_key` actually consumes the key - keeping
+    /// the pure predicate `would_forward_outside_registration` relies on
+    /// from silently drifting out of step with the real D-09 table.
+    #[test]
+    fn selecting_table_predicate_agrees_with_handle_selecting_key() {
+        let mut keysyms: Vec<u32> = (0x20..=0x7E).collect();
+        keysyms.push(0xFF08);
+        keysyms.push(0xFF09);
+        keysyms.push(0xFF0D);
+        keysyms.push(0xFF1B);
+        keysyms.extend(0xFF50..=0xFF57);
+        keysyms.push(0xFF8D);
+        keysyms.push(0xFFBE);
+        keysyms.push(0xFFFF);
+
+        let modifier_sets = [0u32, MOD_CTRL, MOD_ALT, MOD_SUPER, MOD_CTRL | MOD_ALT];
+
+        for &keysym in &keysyms {
+            for &modifiers in &modifier_sets {
+                let mut c = SekkaContext::new();
+                c.process_key('K', false);
+                c.process_key('a', false);
+                c.process_key('\0', true);
+                c.process_key('\0', true);
+                assert_eq!(c.state(), ConversionState::Selecting);
+
+                let expected = handle_selecting_key(&mut c, keysym, modifiers);
+                let actual = is_selecting_table_key(keysym, modifiers);
+                assert_eq!(
+                    actual, expected,
+                    "keysym={:#x} modifiers={:#x}",
+                    keysym, modifiers
+                );
+            }
+        }
+    }
+
+    /// D-171: the worked recursion example, without a dictionary - only the
+    /// outermost step's Enter ever reaches the application; the inner
+    /// step's Enter registers its word into the outer step's own word
+    /// instead, and the prompt/reading getters reflect exactly one, then
+    /// zero, nested readings.
+    #[test]
+    fn nested_registration_through_the_c_abi_commits_only_the_outermost_word() {
+        unsafe {
+            let ctx = sekka_context_new();
+
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+
+            for ch in "Seki".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            let nested = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(nested, 1);
+            assert_eq!(reg_prompt_string(ctx), "せき 登録 ");
+            assert_eq!(reg_reading_string(ctx), "せっか");
+
+            for ch in "Ishi".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+
+            let finished_inner = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished_inner, 1);
+            assert!(sekka_context_poll_output(ctx).is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(reg_prompt_string(ctx), "登録 ");
+            assert_eq!(preedit_string(ctx), "いし");
+
+            for ch in "Ka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+
+            let finished_outer = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished_outer, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "いしか");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-171/D-179: Esc from inside a nested registration step cancels only
+    /// that step and returns exactly to the step before its own Ctrl-R was
+    /// pressed (D-179 applied recursively) - a second Esc then cancels the
+    /// outer step the same way, restoring the very first commit display and
+    /// committing nothing.
+    #[test]
+    fn nested_escape_returns_to_the_outer_step_before_ctrl_r() {
+        unsafe {
+            let ctx = sekka_context_new();
+
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            for ch in "Seki".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            for ch in "Ishi".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF1B, 0, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(reg_prompt_string(ctx), "登録 ");
+            assert_eq!(preedit_string(ctx), "せき");
+            assert!(sekka_context_poll_output(ctx).is_null());
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF1B, 0, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(preedit_string(ctx), "せっか");
+            assert!(sekka_context_poll_output(ctx).is_null());
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-171/D-169: Ctrl-R on a shape `begin_registration` refuses, pressed
+    /// from inside an already-active registration step, is consumed and
+    /// changes nothing at all - in particular it does not open a second,
+    /// nested level.
+    #[test]
+    fn ctrl_r_inside_registration_on_a_refused_shape_changes_nothing() {
+        unsafe {
+            let ctx = sekka_context_new();
+
+            for ch in "Sekka".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            for ch in "KaKu".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(reg_prompt_string(ctx), "登録 ");
+            assert!(sekka_context_poll_output(ctx).is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+
+            sekka_context_free(ctx);
         }
     }
 }

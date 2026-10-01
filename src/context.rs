@@ -823,6 +823,56 @@ impl SekkaContext {
         }
     }
 
+    /// Deletes the last character of the innermost registration step's word
+    /// (D-175)
+    ///
+    /// The word being assembled stands in for the application: a BackSpace
+    /// that the empty inner step did not consume (`route_key` on
+    /// `active_mut()` returned 0) deletes its last character instead. It is
+    /// a plain string that keeps no per-word original romaji - unlike
+    /// `SekkaContext::backspace`, there is nothing to revert to, only a
+    /// character to drop. Recurses to the innermost step exactly like
+    /// `active`/`active_mut` (D-171).
+    ///
+    /// # Returns
+    /// true when a character was popped from the innermost step's `draft`,
+    /// false when not registering or the innermost step's `draft` was
+    /// already empty
+    pub fn pop_registration_draft(&mut self) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+        if session.inner.is_registering() {
+            return session.inner.pop_registration_draft();
+        }
+        session.draft.pop().is_some()
+    }
+
+    /// Appends a character to the innermost registration step's word (D-177)
+    ///
+    /// A printable key that would reach the application outside
+    /// registration (the inner step had nothing to commit it with, so
+    /// `route_key` on `active_mut()` returned 0) goes to the end of the word
+    /// instead - even when the innermost step's own buffer is empty (the
+    /// registration-mode counterpart of `commit_with_trailing_char`'s D-158,
+    /// but always appending since there is no per-key commit to attach to
+    /// here). Recurses to the innermost step exactly like `active`/
+    /// `active_mut` (D-171).
+    ///
+    /// # Returns
+    /// true when `ch` was appended to the innermost step's `draft`, false
+    /// when not registering
+    pub fn push_registration_draft(&mut self, ch: char) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+        if session.inner.is_registering() {
+            return session.inner.push_registration_draft(ch);
+        }
+        session.draft.push(ch);
+        true
+    }
+
     /// The outermost registration step's typed reading, for the application
     /// input position (client preedit, D-170) - `None` outside registration
     pub fn registration_reading(&self) -> Option<&str> {
