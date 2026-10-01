@@ -2433,7 +2433,7 @@ mod tests {
         unsafe {
             let ctx = sekka_context_new();
 
-            for ch in [b'K', b'a', b'n', b'j'] {
+            for ch in "Kanj".bytes() {
                 sekka_context_process_key_event(ctx, ch as u32, 0, 0);
             }
             let consumed = sekka_context_process_key_event(ctx, b'd' as u32, MOD_ALT, 0);
