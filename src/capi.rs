@@ -112,7 +112,10 @@ fn is_printable_ascii(keysym: u32) -> bool {
 /// (`sekka_context_process_key_event`). Since D-161 (Phase 9), BackSpace has its
 /// own entry in this table (closes the candidate window and reverts to the
 /// original romaji, D-160) instead of falling through to "other key" like it used
-/// to.
+/// to. Since D-167 (Phase 10), Ctrl-R also has its own entry: it enters word
+/// registration from inside the candidate window, exactly like from the commit
+/// display state (`dispatch_input`'s own Ctrl-R branch); a shape refused by
+/// `begin_registration` (D-169) is still consumed here and changes nothing else.
 fn handle_selecting_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) -> bool {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
@@ -169,6 +172,12 @@ fn handle_selecting_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) -> 
         }
         if ctrl_letter(keysym, b'e') {
             ctx.select_zenkaku();
+            return true;
+        }
+        if ctrl_letter(keysym, b'r') {
+            // D-167: Ctrl-R also enters registration from the reselection
+            // window; a refused shape (D-169) is consumed and changes nothing.
+            ctx.begin_registration();
             return true;
         }
         return false;
@@ -332,24 +341,42 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
     dispatch_input(ctx, forward_key, keysym, modifiers)
 }
 
-/// Dispatches a key event while registering (D-172/D-176/REG-02, Phase 10)
+/// Dispatches a key event while registering (D-172/D-174/D-176/REG-02, Phase 10)
 ///
 /// An Enter with no modifier finishes the current registration step
-/// (`finish_registration`, D-172/D-176). Every other key is routed to the
-/// innermost step's context via `route_key`, exactly like an ordinary key
-/// event, except that its forward-key result is always discarded - nothing
-/// typed while registering is ever forwarded to the application (REG-02;
-/// what would normally be forwarded, such as Ctrl/Alt/Super-modified keys or
-/// Enter itself outside registration, simply has no effect here beyond
-/// whatever `route_key` already did to the inner context). The caller is
-/// responsible for calling `ctx.absorb_registration_output()` afterward
-/// (REG-02: pulling any newly committed inner output up into `draft` is a
-/// separate step, shared with the trigger path).
+/// (`finish_registration`, D-172/D-176). An unmodified Esc or Ctrl-G cancels
+/// the step (D-174) - unless the innermost step's own candidate window is
+/// open, in which case they only close that window, exactly like outside
+/// registration (D-09): the key is routed through `route_key` first so
+/// `handle_selecting_key`'s own Esc/Ctrl-G/q entries close the window,
+/// leaving the registration session itself in place. `q` needs no dedicated
+/// branch here: inside the candidate window `route_key` already closes it
+/// (D-09's table), and outside it `q` is simply ordinary romaji input
+/// (D-174). Every other key is routed to the innermost step's context via
+/// `route_key`, exactly like an ordinary key event, except that its
+/// forward-key result is always discarded - nothing typed while registering
+/// is ever forwarded to the application (REG-02; what would normally be
+/// forwarded, such as Ctrl/Alt/Super-modified keys or Enter itself outside
+/// registration, simply has no effect here beyond whatever `route_key`
+/// already did to the inner context). The caller is responsible for calling
+/// `ctx.absorb_registration_output()` afterward (REG-02: pulling any newly
+/// committed inner output up into `draft` is a separate step, shared with
+/// the trigger path).
 fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
     if !ctrl && !other && (keysym == 0xFF0D || keysym == 0xFF8D) {
         ctx.finish_registration();
+        return;
+    }
+
+    if (!ctrl && !other && keysym == 0xFF1B) || (ctrl && !other && ctrl_letter(keysym, b'g')) {
+        if ctx.active().state() == ConversionState::Selecting {
+            let mut discarded_forward = false;
+            route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+        } else {
+            ctx.cancel_registration();
+        }
         return;
     }
 
@@ -3920,6 +3947,212 @@ mod tests {
             assert_eq!(sekka_context_is_registering(ctx), 0);
             assert_eq!(reg_reading_string(ctx), "");
             assert_eq!(reg_prompt_string(ctx), "");
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    // === D-167/D-169/D-174 entry and cancel through the C ABI (Phase 10) ===
+
+    /// D-167: Ctrl-R also enters registration from inside the reselection
+    /// window, and captures the typed reading (D-168) - not the display of
+    /// whichever candidate happened to be selected.
+    #[test]
+    fn ctrl_r_in_selection_mode_enters_registration() {
+        unsafe {
+            let ctx = sekka_context_new();
+            reselection_is_entered_for_ka_without_a_dictionary(ctx);
+            // Advance to the second candidate (カ) before pressing Ctrl-R.
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "カ");
+            assert_eq!(sekka_context_get_candidate_index(ctx), 1);
+
+            let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(entered, 1);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(
+                reg_reading_string(ctx),
+                "か",
+                "the typed reading, not the selected candidate's display"
+            );
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF1Bu32, 0, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(sekka_context_get_candidate_count(ctx), 4);
+            assert_eq!(sekka_context_get_candidate_index(ctx), 1);
+            assert_eq!(preedit_string(ctx), "カ");
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-169: Ctrl-R on a shape `begin_registration` refuses (okuri-ari here)
+    /// is consumed and changes nothing, whether pressed from the commit
+    /// display state or from inside the candidate window.
+    #[test]
+    fn ctrl_r_on_a_refused_shape_is_consumed_and_changes_nothing() {
+        unsafe {
+            let ctx = sekka_context_new();
+            for ch in "KaKu".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            let preedit_before = preedit_string(ctx);
+            assert!(!preedit_before.is_empty());
+
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(preedit_string(ctx), preedit_before);
+
+            sekka_context_trigger(ctx);
+            let count_before = sekka_context_get_candidate_count(ctx);
+            assert!(count_before > 0);
+
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+            assert_eq!(sekka_context_get_candidate_count(ctx), count_before);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-167 / D-03: Ctrl-R while romaji is still being typed (no staged
+    /// candidate) keeps its old meaning unchanged - commit the romaji as it
+    /// is and forward the key. Ctrl-R with nothing at all typed is
+    /// unconsumed, same as any other Ctrl+letter with an empty buffer.
+    #[test]
+    fn ctrl_r_during_romaji_input_still_commits_and_forwards() {
+        unsafe {
+            let ctx = sekka_context_new();
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "Ka");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            sekka_context_free(ctx);
+
+            let ctx = sekka_context_new();
+            let consumed = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(consumed, 0);
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// D-174 / D-179: Esc and Ctrl-G cancel registration from the commit
+    /// display state (no inner candidate window open) and return exactly to
+    /// the staged candidate as if Ctrl-R had never been pressed - the outer
+    /// step can still be committed normally afterward.
+    #[test]
+    fn escape_and_ctrl_g_cancel_registration_back_to_the_staged_candidate() {
+        unsafe {
+            for (keysym, modifiers) in [(0xFF1Bu32, 0u32), (b'g' as u32, 0x4u32)] {
+                let ctx = make_commit_display_state();
+                let entered = sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+                assert_eq!(entered, 1, "keysym={:#x}", keysym);
+
+                sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+                sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, modifiers, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    0,
+                    "keysym={:#x}",
+                    keysym
+                );
+                let output = sekka_context_poll_output(ctx);
+                assert!(output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(sekka_context_is_registering(ctx), 0, "keysym={:#x}", keysym);
+                assert_eq!(preedit_string(ctx), "か", "keysym={:#x}", keysym);
+
+                // D-162: outside registration the step continues exactly as before.
+                let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+                assert_eq!(finished, 1, "keysym={:#x}", keysym);
+                let output = sekka_context_poll_output(ctx);
+                assert!(!output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "か");
+                sekka_free_string(output);
+                assert_eq!(
+                    sekka_context_take_forward_key(ctx),
+                    1,
+                    "keysym={:#x}",
+                    keysym
+                );
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    /// D-174: Esc, `q` and Ctrl-G inside the *inner* candidate window only
+    /// close that window (D-09) and leave the registration session itself
+    /// in place - the word being assembled reverts to what was staged
+    /// before the window was entered.
+    #[test]
+    fn escape_q_and_ctrl_g_in_the_inner_window_only_close_the_window() {
+        unsafe {
+            for (keysym, modifiers) in [
+                (0xFF1Bu32, 0u32),
+                (b'q' as u32, 0u32),
+                (b'g' as u32, 0x4u32),
+            ] {
+                let ctx = make_commit_display_state();
+                sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+                sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+                sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+                sekka_context_trigger(ctx); // stage か
+                sekka_context_trigger(ctx); // enter the inner candidate window
+                sekka_context_trigger(ctx); // advance to カ
+
+                let consumed = sekka_context_process_key_event(ctx, keysym, modifiers, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+                let output = sekka_context_poll_output(ctx);
+                assert!(output.is_null(), "keysym={:#x}", keysym);
+                assert_eq!(sekka_context_is_registering(ctx), 1, "keysym={:#x}", keysym);
+                assert_eq!(preedit_string(ctx), "か", "keysym={:#x}", keysym);
+
+                sekka_context_free(ctx);
+            }
+        }
+    }
+
+    /// REG-05: Enter with nothing ever typed into the registration step is
+    /// consumed but changes nothing - registration stays active, nothing is
+    /// committed and the outer reading is unchanged.
+    #[test]
+    fn enter_with_an_empty_word_is_consumed_and_changes_nothing() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            let consumed = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(consumed, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(output.is_null());
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(reg_reading_string(ctx), "か");
+            assert_eq!(preedit_string(ctx), "");
 
             sekka_context_free(ctx);
         }

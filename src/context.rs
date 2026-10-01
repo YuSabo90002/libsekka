@@ -307,6 +307,17 @@ pub struct SekkaContext {
     registration: Option<Box<RegistrationSession>>,
 }
 
+/// D-169 — only okuri-nashi `CaseBased` / all-lowercase `HiraganaConvertible`
+/// input is accepted; `build_candidate_list` already leaves the reading
+/// empty for okuri-ari, `NumberOnly`, `NumberPrefixed` and `Symbol` input; a
+/// reading that still contains ASCII (romaji the converter could not turn
+/// into kana, e.g. `Kanj` -> 「かんj」) has the same headword shape as
+/// SKK-JISYO.L's okuri-ari convention keys (「かk」, D-169's own definition),
+/// would collide with them, and is refused the same way.
+fn is_registrable_reading(reading: &str) -> bool {
+    !reading.is_empty() && !reading.chars().any(|c| c.is_ascii())
+}
+
 /// The label shown in the popup while registering a word (D-170). The
 /// trailing character is a half-width space, matching the plan's
 /// `registration_prompt()` layout (each reading segment already ends in a
@@ -633,7 +644,7 @@ impl SekkaContext {
         let Some(last) = self.last_commit.as_ref() else {
             return false;
         };
-        if last.reading.is_empty() {
+        if !is_registrable_reading(&last.reading) {
             return false;
         }
 
@@ -742,6 +753,40 @@ impl SekkaContext {
 
         self.discard_staged();
         self.committed_output = Some(word);
+        true
+    }
+
+    /// Cancels word registration (Esc/C-g outside the inner candidate
+    /// window, D-174/D-179)
+    ///
+    /// D-179 — this context's own state was frozen at Ctrl-R, so dropping
+    /// the step returns exactly to the state before Ctrl-R (the same staged
+    /// candidate, or the same reselection window with the same index);
+    /// nothing is registered or committed; the dropped inner step is never
+    /// flushed, so its staged candidate is never learned.
+    ///
+    /// Not registering: no-op, returns false. When this step's own `inner`
+    /// is itself still registering, delegates to its `cancel_registration`
+    /// so only the innermost step is cancelled (D-171 — the same
+    /// "innermost step first" delegation as `finish_registration`).
+    /// Otherwise (this step is the innermost): drops the session, which is
+    /// all that is needed since `begin_registration` never touched this
+    /// context's own `last_commit`/`state`/`candidates`/`candidate_index`/
+    /// `preedit` in the first place (D-170: frozen at the moment Ctrl-R was
+    /// pressed).
+    ///
+    /// # Returns
+    /// true when a step was cancelled, false when nothing was registering
+    pub fn cancel_registration(&mut self) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+
+        if session.inner.is_registering() {
+            return session.inner.cancel_registration();
+        }
+
+        self.registration = None;
         true
     }
 
@@ -4900,5 +4945,200 @@ mod tests {
             "実測: {:?}",
             candidates.iter().map(|c| &c.display).collect::<Vec<_>>()
         );
+    }
+
+    // === Word registration entry / cancel (D-167/D-169/D-174/D-179/REG-04/REG-05, Phase 10) ===
+
+    /// D-169: `begin_registration` refuses okuri-ari, `NumberOnly`,
+    /// `NumberPrefixed` and `Symbol` input, and input whose reading still
+    /// contains ASCII (the converter could not turn all of it into kana,
+    /// e.g. `Kanj` -> 「かんj」, which has the same headword shape as
+    /// SKK-JISYO.L's okuri-ari convention keys). Refusing is a no-op: the
+    /// staged candidate, the preedit and the state are unchanged, and
+    /// nothing is committed.
+    #[test]
+    fn registration_entry_is_refused_for_okuri_numbers_symbols_and_ascii_readings() {
+        for input in ["KaKu", "kanJi", "123", "2023nen", ".", "Kanj"] {
+            let mut ctx = SekkaContext::new();
+            for ch in input.chars() {
+                ctx.process_key(ch, false);
+            }
+            let staged = ctx.process_key('\0', true);
+            assert!(staged, "input={input}");
+            let preedit = ctx.get_preedit().to_string();
+            assert!(!preedit.is_empty(), "input={input}");
+            assert!(ctx.has_staged_candidate(), "input={input}");
+
+            assert!(!ctx.begin_registration(), "input={input} should be refused");
+            assert!(!ctx.is_registering(), "input={input}");
+            assert_eq!(ctx.get_preedit(), preedit, "input={input}");
+            assert!(ctx.has_staged_candidate(), "input={input}");
+            assert!(ctx.poll_output().is_none(), "input={input}");
+        }
+
+        // KaKu (okuri-ari): the refusal is also a no-op from inside the
+        // candidate window (D-167 - Ctrl-R is also accepted from Selecting,
+        // and a refused shape there must not move the state either).
+        let mut ctx = SekkaContext::new();
+        for ch in "KaKu".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.state(), ConversionState::Selecting);
+        assert!(!ctx.begin_registration());
+        assert_eq!(ctx.state(), ConversionState::Selecting);
+    }
+
+    /// D-169: `begin_registration` accepts okuri-nashi `CaseBased` input
+    /// (leading uppercase, `Kaku`) and all-lowercase `HiraganaConvertible`
+    /// input (`kaku`), and the reading it captures is the plain kana of what
+    /// was typed.
+    #[test]
+    fn registration_entry_accepts_okuri_nashi_case_based_and_lowercase_input() {
+        let mut ctx = SekkaContext::new();
+        for ch in "Kaku".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+        assert_eq!(ctx.registration_reading(), Some("かく"));
+
+        let mut ctx = SekkaContext::new();
+        for ch in "kaku".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+        assert_eq!(ctx.registration_reading(), Some("かく"));
+
+        let mut ctx = SekkaContext::new();
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+        assert_eq!(ctx.registration_reading(), Some("せっか"));
+    }
+
+    /// D-179 / REG-04: cancelling registration from the commit display state
+    /// (no candidate window open) restores exactly the state right before
+    /// Ctrl-R was pressed - the same staged candidate, still committable and
+    /// still reselectable - and neither the candidate staged before Ctrl-R
+    /// nor the inner step's own commit is ever learned.
+    #[test]
+    fn cancel_registration_restores_the_commit_display_exactly() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "赤化");
+
+        assert!(ctx.begin_registration());
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+
+        assert!(ctx.cancel_registration());
+
+        assert!(!ctx.is_registering());
+        assert_eq!(ctx.get_preedit(), "赤化");
+        assert!(ctx.has_staged_candidate());
+        assert_eq!(ctx.state(), ConversionState::Input);
+        assert!(ctx.poll_output().is_none());
+
+        assert!(
+            user_dict.lookup("せき").expect("lookup failed").is_empty(),
+            "the cancelled inner step's staged candidate (石) must not be learned"
+        );
+        assert!(
+            user_dict
+                .lookup("せっか")
+                .expect("lookup failed")
+                .is_empty(),
+            "the candidate staged before Ctrl-R (赤化) must not be learned either"
+        );
+
+        // The outer step still works normally: the same staged candidate
+        // can be committed as if Ctrl-R had never been pressed.
+        assert!(ctx.flush_last_commit());
+        assert_eq!(ctx.poll_output(), Some("赤化".to_string()));
+    }
+
+    /// D-167 / D-179: cancelling registration entered from inside the
+    /// candidate window (a second Ctrl-J's reselection, D-08改) restores the
+    /// same window with the same selected index and the same candidate
+    /// list - not the original first candidate.
+    #[test]
+    fn cancel_registration_restores_the_selection_window_exactly() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せき", "石");
+        dict.add_entry("せき", "席");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+
+        commit_then_reselect(&mut ctx, "Seki");
+        ctx.next_candidate();
+        assert_eq!(ctx.get_candidate_index(), 1);
+        assert_eq!(ctx.get_preedit(), "席");
+        let expected_display: Vec<String> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.clone())
+            .collect();
+
+        assert!(ctx.begin_registration());
+        assert_eq!(ctx.registration_reading(), Some("せき"));
+
+        for ch in "Ka".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.absorb_registration_output();
+
+        assert!(ctx.cancel_registration());
+
+        assert_eq!(ctx.state(), ConversionState::Selecting);
+        assert_eq!(ctx.get_candidate_index(), 1);
+        assert_eq!(ctx.get_preedit(), "席");
+        let actual_display: Vec<String> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.clone())
+            .collect();
+        assert_eq!(actual_display, expected_display);
+    }
+
+    /// REG-05: an Enter with an empty word (nothing was ever typed into the
+    /// registration step) is consumed but changes nothing - registration
+    /// mode is left in place, nothing is committed and `registration_word`
+    /// stays the empty string.
+    #[test]
+    fn empty_draft_enter_changes_nothing() {
+        let mut ctx = SekkaContext::new();
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        assert!(!ctx.finish_registration());
+        assert!(ctx.is_registering());
+        assert!(ctx.poll_output().is_none());
+        assert_eq!(ctx.registration_word(), Some(String::new()));
     }
 }
