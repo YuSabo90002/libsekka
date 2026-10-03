@@ -286,8 +286,14 @@ fn ascii_to_fullwidth(input: &str) -> String {
 /// In Unicode, hiragana (ぁ U+3041 to ん U+3093) sits 0x60 below the
 /// corresponding katakana (ァ U+30A1 to ン U+30F3); the conversion uses that
 /// difference. Characters outside the hiragana range are preserved.
+///
+/// U+3046 U+309B (u + the spacing voiced sound mark, what the romaji v row
+/// produces) is replaced with the single character U+30F4 before the +0x60 shift
+/// (D-207). Only the katakana candidate gets the single character; hiragana
+/// candidates and readings keep the two-character form.
 fn hiragana_to_katakana(input: &str) -> String {
     input
+        .replace("\u{3046}\u{309B}", "\u{30F4}")
         .chars()
         .map(|c| {
             // Convert the range ぁ(U+3041) to ん(U+3093) into katakana.
@@ -1265,6 +1271,52 @@ mod tests {
         assert_eq!(
             result, digits_53_leading_zero,
             "even with a leading 0, 53 digits should fall back unconverted and return the input as it is"
+        );
+    }
+
+    #[test]
+    fn spaced_voiced_mark_after_u_becomes_a_single_vu_in_katakana() {
+        // D-207: u + U+309B becomes the single character U+30F4.
+        assert_eq!(hiragana_to_katakana("\u{3046}\u{309B}"), "\u{30F4}");
+        assert_eq!(
+            hiragana_to_katakana("\u{3046}\u{309B}\u{3041}いおりん"),
+            "\u{30F4}ァイオリン"
+        );
+        assert_eq!(
+            hiragana_to_katakana("\u{3046}\u{309B}\u{3043}"),
+            "\u{30F4}ィ"
+        );
+        // A lone u is converted as before, and a voiced mark after anything
+        // other than u is left alone.
+        assert_eq!(hiragana_to_katakana("う"), "ウ");
+        assert_eq!(hiragana_to_katakana("か\u{309B}"), "カ\u{309B}");
+    }
+
+    #[test]
+    fn vaiorin_typed_through_the_context_reaches_the_katakana_candidate() {
+        use crate::context::SekkaContext;
+
+        let mut ctx = SekkaContext::new();
+        for ch in "Vaiorin".chars() {
+            ctx.process_key(ch, false);
+        }
+        // Ctrl-J puts the first candidate in the preedit, in the two-character form.
+        assert!(ctx.process_key('\0', true));
+        assert_eq!(ctx.get_preedit(), "\u{3046}\u{309B}\u{3041}いおりん");
+        // A second Ctrl-J reopens the candidates for reselection.
+        assert!(ctx.process_key('\0', true));
+        assert!(ctx.select_katakana());
+        assert_eq!(ctx.get_preedit(), "\u{30F4}ァイオリン");
+        // The hiragana candidate keeps the two-character form.
+        let hiragana: Vec<String> = ctx
+            .get_candidates()
+            .iter()
+            .filter(|c| c.kind == CandidateKind::Hiragana)
+            .map(|c| c.display.clone())
+            .collect();
+        assert_eq!(
+            hiragana,
+            vec!["\u{3046}\u{309B}\u{3041}いおりん".to_string()]
         );
     }
 }

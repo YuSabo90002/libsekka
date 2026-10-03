@@ -445,6 +445,15 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("pyu", "ぴゅ");
     rule!("pyo", "ぴょ");
 
+    // === V row: U+3046 U+309B, the spacing voiced sound mark after u (D-207) ===
+    // Never U+3094 or U+3099: the master dictionary headings use U+3046 U+309B.
+    // The outputs are written as escapes because the three forms look alike.
+    rule!("vu", "\u{3046}\u{309B}");
+    rule!("va", "\u{3046}\u{309B}\u{3041}");
+    rule!("vi", "\u{3046}\u{309B}\u{3043}");
+    rule!("ve", "\u{3046}\u{309B}\u{3047}");
+    rule!("vo", "\u{3046}\u{309B}\u{3049}");
+
     // === Small kana (x/l prefix) ===
     rule!("xa", "ぁ");
     rule!("xi", "ぃ");
@@ -502,6 +511,167 @@ mod tests {
         }
         result
     }
+
+    // The 151 rules of the v1.3 table (commit 087c7a0), generated from the source
+    // rather than written by hand. For that table convert(input) equals the rule
+    // output for every entry, so this is the pre-change convert() snapshot (D-210).
+    const LEGACY_RULES: [(&str, &str); 151] = [
+        ("a", "あ"),
+        ("i", "い"),
+        ("u", "う"),
+        ("e", "え"),
+        ("o", "お"),
+        ("ka", "か"),
+        ("ki", "き"),
+        ("ku", "く"),
+        ("ke", "け"),
+        ("ko", "こ"),
+        ("sa", "さ"),
+        ("si", "し"),
+        ("shi", "し"),
+        ("su", "す"),
+        ("se", "せ"),
+        ("so", "そ"),
+        ("ta", "た"),
+        ("ti", "ち"),
+        ("chi", "ち"),
+        ("tu", "つ"),
+        ("tsu", "つ"),
+        ("te", "て"),
+        ("to", "と"),
+        ("na", "な"),
+        ("ni", "に"),
+        ("nu", "ぬ"),
+        ("ne", "ね"),
+        ("no", "の"),
+        ("ha", "は"),
+        ("hi", "ひ"),
+        ("hu", "ふ"),
+        ("fu", "ふ"),
+        ("he", "へ"),
+        ("ho", "ほ"),
+        ("ma", "ま"),
+        ("mi", "み"),
+        ("mu", "む"),
+        ("me", "め"),
+        ("mo", "も"),
+        ("ya", "や"),
+        ("yu", "ゆ"),
+        ("yo", "よ"),
+        ("ra", "ら"),
+        ("ri", "り"),
+        ("ru", "る"),
+        ("re", "れ"),
+        ("ro", "ろ"),
+        ("wa", "わ"),
+        ("wi", "ゐ"),
+        ("we", "ゑ"),
+        ("wo", "を"),
+        ("nn", "ん"),
+        ("ga", "が"),
+        ("gi", "ぎ"),
+        ("gu", "ぐ"),
+        ("ge", "げ"),
+        ("go", "ご"),
+        ("za", "ざ"),
+        ("zi", "じ"),
+        ("ji", "じ"),
+        ("zu", "ず"),
+        ("ze", "ぜ"),
+        ("zo", "ぞ"),
+        ("da", "だ"),
+        ("di", "ぢ"),
+        ("du", "づ"),
+        ("de", "で"),
+        ("do", "ど"),
+        ("ba", "ば"),
+        ("bi", "び"),
+        ("bu", "ぶ"),
+        ("be", "べ"),
+        ("bo", "ぼ"),
+        ("pa", "ぱ"),
+        ("pi", "ぴ"),
+        ("pu", "ぷ"),
+        ("pe", "ぺ"),
+        ("po", "ぽ"),
+        ("kya", "きゃ"),
+        ("kyu", "きゅ"),
+        ("kyo", "きょ"),
+        ("sha", "しゃ"),
+        ("shu", "しゅ"),
+        ("sho", "しょ"),
+        ("sya", "しゃ"),
+        ("syu", "しゅ"),
+        ("syo", "しょ"),
+        ("cha", "ちゃ"),
+        ("chu", "ちゅ"),
+        ("cho", "ちょ"),
+        ("tya", "ちゃ"),
+        ("tyu", "ちゅ"),
+        ("tyo", "ちょ"),
+        ("ja", "じゃ"),
+        ("ju", "じゅ"),
+        ("jo", "じょ"),
+        ("jya", "じゃ"),
+        ("jyu", "じゅ"),
+        ("jyo", "じょ"),
+        ("zya", "じゃ"),
+        ("zyu", "じゅ"),
+        ("zyo", "じょ"),
+        ("nya", "にゃ"),
+        ("nyu", "にゅ"),
+        ("nyo", "にょ"),
+        ("hya", "ひゃ"),
+        ("hyu", "ひゅ"),
+        ("hyo", "ひょ"),
+        ("mya", "みゃ"),
+        ("myu", "みゅ"),
+        ("myo", "みょ"),
+        ("rya", "りゃ"),
+        ("ryu", "りゅ"),
+        ("ryo", "りょ"),
+        ("gya", "ぎゃ"),
+        ("gyu", "ぎゅ"),
+        ("gyo", "ぎょ"),
+        ("bya", "びゃ"),
+        ("byu", "びゅ"),
+        ("byo", "びょ"),
+        ("pya", "ぴゃ"),
+        ("pyu", "ぴゅ"),
+        ("pyo", "ぴょ"),
+        ("xa", "ぁ"),
+        ("xi", "ぃ"),
+        ("xu", "ぅ"),
+        ("xe", "ぇ"),
+        ("xo", "ぉ"),
+        ("la", "ぁ"),
+        ("li", "ぃ"),
+        ("lu", "ぅ"),
+        ("le", "ぇ"),
+        ("lo", "ぉ"),
+        ("xya", "ゃ"),
+        ("xyu", "ゅ"),
+        ("xyo", "ょ"),
+        ("xtu", "っ"),
+        ("ltu", "っ"),
+        ("xtsu", "っ"),
+        ("ltsu", "っ"),
+        ("xwa", "ゎ"),
+        ("fa", "ふぁ"),
+        ("fi", "ふぃ"),
+        ("fe", "ふぇ"),
+        ("fo", "ふぉ"),
+        ("dya", "ぢゃ"),
+        ("dyu", "ぢゅ"),
+        ("dyo", "ぢょ"),
+        ("thi", "てぃ"),
+        ("dhi", "でぃ"),
+        ("-", "ー"),
+    ];
+
+    // Inputs whose output a later decision changed on purpose. Every input here
+    // must also be in LEGACY_RULES.
+    const CHANGED_RULES: [(&str, &str); 0] = [];
 
     #[test]
     fn is_strictly_convertible_boundary_cases() {
@@ -699,5 +869,74 @@ mod tests {
         // Multiple spellings of fu.
         assert_eq!(convert("fu"), "ふ");
         assert_eq!(convert("hu"), "ふ");
+    }
+
+    #[test]
+    fn legacy_rules_keep_their_outputs_except_wi_and_we() {
+        // D-210: every rule of the v1.3 table still converts the same way, apart
+        // from the inputs listed in CHANGED_RULES. The list cannot grow silently:
+        // each of its inputs must be a legacy input.
+        for (input, _) in CHANGED_RULES {
+            assert!(
+                LEGACY_RULES
+                    .iter()
+                    .any(|(legacy_input, _)| *legacy_input == input),
+                "CHANGED_RULES input is not a legacy input: {:?}",
+                input
+            );
+        }
+        for (input, legacy) in LEGACY_RULES {
+            let expected = CHANGED_RULES
+                .iter()
+                .find(|(changed_input, _)| *changed_input == input)
+                .map_or(legacy, |(_, changed)| *changed);
+            assert_eq!(convert(input), expected, "input={:?}", input);
+            assert!(
+                is_strictly_convertible(input),
+                "legacy input must stay strictly convertible: input={:?}",
+                input
+            );
+        }
+    }
+
+    #[test]
+    fn every_rule_input_is_unique_so_rule_map_never_drops_a_rule() {
+        let conv = RomajiConverter::new();
+        assert_eq!(
+            conv.rule_map.len(),
+            conv.rules.len(),
+            "rule_map is built with HashMap::insert, so a duplicated input would \
+             silently drop the earlier rule (D-209)"
+        );
+        // 151 (v1.3 table) + 5 (V row, D-205)
+        assert_eq!(conv.rules.len(), 156);
+    }
+
+    #[test]
+    fn v_row_outputs_use_u3046_u309b_and_never_u3094_or_u3099() {
+        // D-207: the hiragana form is u (U+3046) + the spacing voiced mark (U+309B).
+        assert_eq!(convert("vu"), "\u{3046}\u{309B}");
+        assert_eq!(convert("va"), "\u{3046}\u{309B}\u{3041}");
+        assert_eq!(convert("vi"), "\u{3046}\u{309B}\u{3043}");
+        assert_eq!(convert("ve"), "\u{3046}\u{309B}\u{3047}");
+        assert_eq!(convert("vo"), "\u{3046}\u{309B}\u{3049}");
+        for input in ["vu", "va", "vi", "ve", "vo"] {
+            let out = convert(input);
+            assert!(
+                !out.contains('\u{3094}') && !out.contains('\u{3099}'),
+                "input={:?} out={:?}",
+                input,
+                out
+            );
+            assert!(
+                out.starts_with("\u{3046}\u{309B}"),
+                "input={:?} out={:?}",
+                input,
+                out
+            );
+        }
+        // Uppercase input is lowered by feed, so the same rules apply.
+        assert_eq!(convert("Va"), convert("va"));
+        assert_eq!(convert("Vu"), convert("vu"));
     }
 }
