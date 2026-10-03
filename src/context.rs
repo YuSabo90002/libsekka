@@ -124,14 +124,14 @@ fn merge_candidate(
         let candidate_stage = match_stage(candidate.tier);
         if candidate_stage == existing_stage {
             // Same stage: fold frequency by maximum, exactly as before D-147.
-            if candidate.frequency > existing.frequency {
-                existing.frequency = candidate.frequency;
+            if candidate.last_selected > existing.last_selected {
+                existing.last_selected = candidate.last_selected;
             }
         } else if candidate_stage < existing_stage {
             // An exact match arrived after a fuzzy duplicate. Not reachable
             // through the current push order (tier 0 -> 1 -> 2), but only the
             // exact match's own frequency must survive here (D-147, Pitfall 2).
-            existing.frequency = candidate.frequency;
+            existing.last_selected = candidate.last_selected;
             // For the same reason: learning is recorded per reading (D-34/D-37),
             // so a tier-0 candidate must be recorded under its own exact reading,
             // not the unrelated fuzzy reading that happened to arrive first.
@@ -1327,7 +1327,7 @@ impl SekkaContext {
                 reading: digits.to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 // D-32: no dictionary was consulted at all, so nothing is learned (stays None).
                 tier: 0,
                 learn_pair: None,
@@ -1337,7 +1337,7 @@ impl SekkaContext {
                 reading: digits.to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -1346,7 +1346,7 @@ impl SekkaContext {
                 reading: digits.to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -1355,7 +1355,7 @@ impl SekkaContext {
                 reading: digits.to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -1756,14 +1756,14 @@ mod tests {
             }
         }
 
-        /// Adds a reading/entry pair with a frequency
-        fn add_entry_with_frequency(&mut self, reading: &str, word: &str, freq: u32) {
+        /// Adds a reading/entry pair with a last-selected number
+        fn add_entry_with_last_selected(&mut self, reading: &str, word: &str, last_selected: u64) {
             if let Some((_, entries)) = self.entries.iter_mut().find(|(k, _)| k == reading) {
-                entries.push(DictEntry::new(word).with_frequency(freq));
+                entries.push(DictEntry::new(word).with_last_selected(last_selected));
             } else {
                 self.entries.push((
                     reading.to_string(),
-                    vec![DictEntry::new(word).with_frequency(freq)],
+                    vec![DictEntry::new(word).with_last_selected(last_selected)],
                 ));
             }
         }
@@ -2135,7 +2135,7 @@ mod tests {
     fn confirming_stages_the_candidate_in_the_preedit_without_committing() {
         let mut ctx = SekkaContext::new();
         let mut dict = MockDictionary::new();
-        dict.add_entry_with_frequency("かんじ", "漢字", 10);
+        dict.add_entry_with_last_selected("かんじ", "漢字", 10);
         ctx.add_dictionary(Arc::new(dict));
 
         commit_then_reselect(&mut ctx, "Kanji");
@@ -2667,7 +2667,7 @@ mod tests {
         dict1.add_entry("かんj", "感");
         ctx.add_dictionary(Arc::new(dict1));
         let mut dict2 = MockDictionary::new();
-        dict2.add_entry_with_frequency("かんj", "感", 7);
+        dict2.add_entry_with_last_selected("かんj", "感", 7);
         ctx.add_dictionary(Arc::new(dict2));
 
         commit_then_reselect(&mut ctx, "kanJi");
@@ -2678,7 +2678,7 @@ mod tests {
             .filter(|c| c.display == "感じ")
             .collect();
         assert_eq!(matches.len(), 1);
-        assert_eq!(matches[0].frequency, 7);
+        assert_eq!(matches[0].last_selected, 7);
         assert_eq!(matches[0].score, 1.0);
     }
 
@@ -2699,7 +2699,7 @@ mod tests {
                 reading: "かく".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: Some(("かく".to_string(), "角".to_string())),
             },
@@ -2712,7 +2712,7 @@ mod tests {
                 reading: "かど".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 5,
+                last_selected: 5,
                 tier: 1,
                 learn_pair: Some(("かど".to_string(), "角".to_string())),
             },
@@ -2720,7 +2720,7 @@ mod tests {
 
         assert_eq!(all.len(), 1);
         assert_eq!(
-            all[0].frequency, 0,
+            all[0].last_selected, 0,
             "a fuzzy-stage frequency (learned under a different reading) must not be carried into the exact match"
         );
         assert_eq!(all[0].tier, 0);
@@ -2747,7 +2747,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -2760,7 +2760,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 7,
+                last_selected: 7,
                 tier: 0,
                 learn_pair: None,
             },
@@ -2773,7 +2773,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 2,
+                last_selected: 2,
                 tier: 1,
                 learn_pair: None,
             },
@@ -2786,19 +2786,19 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.95,
-                frequency: 4,
+                last_selected: 4,
                 tier: 2,
                 learn_pair: None,
             },
         );
 
         let kanji = all.iter().find(|c| c.display == "漢字").unwrap();
-        assert_eq!(kanji.frequency, 7);
+        assert_eq!(kanji.last_selected, 7);
         assert_eq!(kanji.tier, 0);
 
         let kanji_ = all.iter().find(|c| c.display == "幹事").unwrap();
         assert_eq!(
-            kanji_.frequency, 4,
+            kanji_.last_selected, 4,
             "tier 1 and tier 2 share the fuzzy stage, so they still fold by maximum"
         );
         assert_eq!(
@@ -2827,7 +2827,7 @@ mod tests {
                 reading: "かど".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.95,
-                frequency: 5,
+                last_selected: 5,
                 tier: 2,
                 learn_pair: Some(("かど".to_string(), "角".to_string())),
             },
@@ -2840,7 +2840,7 @@ mod tests {
                 reading: "かく".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 1,
+                last_selected: 1,
                 tier: 0,
                 learn_pair: Some(("かく".to_string(), "角".to_string())),
             },
@@ -2852,7 +2852,7 @@ mod tests {
             "tier folds to the minimum (the exact match's tier), Pitfall 7"
         );
         assert_eq!(
-            all[0].frequency, 1,
+            all[0].last_selected, 1,
             "only the exact match's own frequency survives when it arrives after a fuzzy duplicate"
         );
         assert_eq!(all[0].score, 1.0, "score still folds by maximum");
@@ -4129,7 +4129,9 @@ mod tests {
         // UserDict::lookup(".") returns 「。」 with a frequency of at least 1.
         let entries = user_dict.lookup(".").expect("lookup failed");
         assert!(
-            entries.iter().any(|e| e.word == "。" && e.frequency >= 1),
+            entries
+                .iter()
+                .any(|e| e.word == "。" && e.last_selected >= 1),
             "UserDict::lookup(\".\") should contain 「。」 with a frequency of at least 1: {:?}",
             entries
         );
@@ -4356,8 +4358,8 @@ mod tests {
             displays
         );
         assert!(
-            moto_candidate.frequency >= 1,
-            "元 should carry the learned frequency: {:?}",
+            moto_candidate.last_selected >= 1,
+            "元 should carry the learned last_selected: {:?}",
             displays
         );
         assert_eq!(
@@ -4450,13 +4452,13 @@ mod tests {
             displays
         );
         assert_eq!(
-            kaku_matches[0].frequency, 0,
+            kaku_matches[0].last_selected, 0,
             "角 must not carry over the frequency learned under かど (D-147, RANK-01): {:?}",
             displays
         );
         assert_eq!(
             first, "核",
-            "an unlearned exact match (核) must not be outranked by 角's borrowed frequency: {:?}",
+            "an unlearned exact match (核) must not be outranked by 角's borrowed last_selected: {:?}",
             displays
         );
         assert_eq!(
@@ -4516,7 +4518,7 @@ mod tests {
             entries[0].word, "感",
             "the recorded word should be the raw word before the okurigana was appended (D-33)"
         );
-        assert!(entries[0].frequency >= 1);
+        assert!(entries[0].last_selected >= 1);
 
         // Reconverting the same input does not produce a word with doubled okurigana.
         let recommitted = commit_then_reselect(&mut ctx, "kanJi");
@@ -4981,9 +4983,9 @@ mod tests {
         let entries = user_dict.lookup("せっか").expect("lookup failed");
         assert_eq!(entries.len(), 2, "{:?}", entries);
         assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].frequency, 3);
+        assert_eq!(entries[0].last_selected, 3);
         assert_eq!(entries[1].word, "赤化");
-        assert_eq!(entries[1].frequency, 2);
+        assert_eq!(entries[1].last_selected, 2);
 
         for ch in "Sekka".chars() {
             ctx.process_key(ch, false);
@@ -5071,7 +5073,7 @@ mod tests {
         let entries = user_dict.lookup("せっか").expect("lookup failed");
         assert_eq!(
             entries,
-            vec![DictEntry::new("石火").with_frequency(1)],
+            vec![DictEntry::new("石火").with_last_selected(1)],
             "赤化 (the candidate staged before Ctrl-R) must not appear: {:?}",
             entries
         );
@@ -5381,7 +5383,7 @@ mod tests {
             sekka_entries
         );
         assert_eq!(sekka_entries[0].word, "石火");
-        assert_eq!(sekka_entries[0].frequency, 1);
+        assert_eq!(sekka_entries[0].last_selected, 1);
     }
 
     /// D-171/D-179: cancelling a nested registration step drops only that
@@ -5575,7 +5577,7 @@ mod tests {
 
         assert_eq!(
             user_dict.lookup("せき").expect("lookup failed"),
-            vec![DictEntry::new("石").with_frequency(1)],
+            vec![DictEntry::new("石").with_last_selected(1)],
             "the intermediate candidate is learned by the ordinary D-12 flush that fired \
              when 'K' was typed - unrelated to finalize_for_reset"
         );
@@ -5654,7 +5656,7 @@ mod tests {
         assert_eq!(ctx.poll_output(), Some("赤化".to_string()));
         assert_eq!(
             user_dict.lookup("せっか").expect("lookup failed"),
-            vec![DictEntry::new("赤化").with_frequency(1)],
+            vec![DictEntry::new("赤化").with_last_selected(1)],
             "outside registration, finalize_for_reset must still learn (D-15 unchanged)"
         );
 

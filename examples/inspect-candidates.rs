@@ -3,7 +3,7 @@
 // SPDX-License-Identifier: GPL-3.0-or-later
 
 //! Re-runnable measurement tool that dumps a whole candidate list with tier,
-//! score and frequency
+//! score and last-selected number
 //!
 //! (a) This tool exists for the practice of D-89 (2) (when the candidate list
 //!     changes, record each changed candidate with the reason) and D-89 (3) (stop
@@ -47,7 +47,7 @@ fn print_usage() {
     eprintln!("usage: inspect-candidates <dictionary path> <romaji input>...");
     eprintln!();
     eprintln!("Loads one master dictionary and, for each romaji input given, prints the");
-    eprintln!("commit display (the first candidate) and every candidate with its tier, score and frequency.");
+    eprintln!("commit display (the first candidate) and every candidate with its tier, score and last-selected number.");
 }
 
 /// Feeds romaji input, presses Ctrl-J (staging the commit display in the preedit)
@@ -117,7 +117,7 @@ fn main() {
                         rank,
                         candidate.tier,
                         candidate.score,
-                        candidate.frequency,
+                        candidate.last_selected,
                         candidate.display
                     );
                 }

@@ -60,16 +60,27 @@ fn print_usage() {
 /// frequency; adding columns would make the E2E-side parsing depend on whether an
 /// annotation is present.
 fn format_dump_line(reading: &str, entry: &DictEntry) -> String {
-    format!("{}\t{}\t{}", reading, entry.word, entry.frequency)
+    format!("{}\t{}\t{}", reading, entry.word, entry.last_selected)
+}
+
+/// Opens a user dictionary for `dump` without migrating or rewriting it (D-197)
+///
+/// `dump` never migrates or rewrites the dictionary (T-04-03-02); this is the one
+/// place that decides it. `UserDict::open` would migrate v1.3 values on the spot, so
+/// the reading-only entry `open_with(path, false)` is used instead.
+fn open_for_dump(
+    path: &str,
+) -> Result<sekka::dictionary::user_dict::UserDict, sekka::dictionary::DictError> {
+    sekka::dictionary::user_dict::UserDict::open_with(path, false)
 }
 
 /// Opens a user dictionary read-only and prints every entry to stdout as three
 /// tab-separated columns (D-101)
 ///
-/// It calls no API other than `UserDict::open` and `Dictionary::prefix_search`
+/// It calls no API other than `open_for_dump` and `Dictionary::prefix_search`
 /// (T-04-03-02: dump must not modify the user dictionary).
 ///
-/// When `UserDict::open` fails, it prints the `Display` of `DictError` plus a note
+/// When `open_for_dump` fails, it prints the `Display` of `DictError` plus a note
 /// that fcitx5 may be using the file and exits on the spot (rather than layering
 /// error handling in the caller), because sled's single-process exclusive lock
 /// (`fs2::FileExt::try_lock_exclusive`, non-blocking) is inherently hit while
@@ -77,7 +88,7 @@ fn format_dump_line(reading: &str, entry: &DictEntry) -> String {
 /// `DictError` is returned to the caller as it is (with no note, since the cause
 /// is something other than lock contention).
 fn dump(path: &str) -> Result<(), sekka::dictionary::DictError> {
-    let dict = match sekka::dictionary::user_dict::UserDict::open(path) {
+    let dict = match open_for_dump(path) {
         Ok(dict) => dict,
         Err(e) => {
             eprintln!("error: cannot open the user dictionary: {}", e);
@@ -143,13 +154,13 @@ fn parse_skk_line(line: &str) -> Option<(String, Vec<DictEntry>)> {
                     } else {
                         Some(annotation.to_string())
                     },
-                    frequency: 0,
+                    last_selected: 0,
                 }
             } else {
                 DictEntry {
                     word: candidate.to_string(),
                     annotation: None,
-                    frequency: 0,
+                    last_selected: 0,
                 }
             }
         })
@@ -424,7 +435,7 @@ fn main() {
                 process::exit(1);
             }
 
-            // dump itself calls process::exit directly when UserDict::open fails,
+            // dump itself calls process::exit directly when open_for_dump fails,
             // so the only Err that reaches here comes from prefix_search.
             if let Err(e) = dump(&args[2]) {
                 eprintln!("error: {}", e);
@@ -456,7 +467,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].word, "愛");
         assert_eq!(entries[0].annotation, None);
-        assert_eq!(entries[0].frequency, 0);
+        assert_eq!(entries[0].last_selected, 0);
         assert_eq!(entries[1].word, "藍");
     }
 
@@ -517,7 +528,7 @@ mod tests {
         let entry = DictEntry {
             word: "東京".to_string(),
             annotation: Some("地名".to_string()),
-            frequency: 0,
+            last_selected: 0,
         };
         let json = serde_json::to_string(&entry).unwrap();
         let restored: DictEntry = serde_json::from_str(&json).unwrap();
@@ -777,7 +788,7 @@ mod tests {
     /// verbatim.
     #[test]
     fn format_dump_line_lays_out_reading_word_and_frequency_tab_separated() {
-        let entry = DictEntry::new("幹事").with_frequency(3);
+        let entry = DictEntry::new("幹事").with_last_selected(3);
         let line = format_dump_line("かんじ", &entry);
         assert_eq!(line, "かんじ\t幹事\t3");
     }

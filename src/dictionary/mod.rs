@@ -18,15 +18,23 @@ use std::path::{Path, PathBuf};
 /// Dictionary entry
 ///
 /// Represents one conversion candidate: the converted text for a reading, its
-/// annotation and how often it was selected.
+/// annotation and when it was last selected.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct DictEntry {
     /// The converted text.
     pub word: String,
     /// Annotation (optional).
     pub annotation: Option<String>,
-    /// Selection frequency (used by the user dictionary only).
-    pub frequency: u32,
+    /// The dictionary-wide sequence number of the last time the user selected
+    /// this word (D-190, Phase 12): 0 means never selected, and the first
+    /// selection in a dictionary gets 1. Master-dictionary entries are always 0.
+    ///
+    /// `#[serde(default)]` keeps master dictionaries built by v1.3's
+    /// `sekka-dict-tool` readable: their value blobs carry only the old count
+    /// key, which is ignored as an unknown field and never read as a sequence
+    /// number (D-204, D-195). Serialization writes only this key (D-196).
+    #[serde(default)]
+    pub last_selected: u64,
 }
 
 impl DictEntry {
@@ -35,7 +43,7 @@ impl DictEntry {
         Self {
             word: word.into(),
             annotation: None,
-            frequency: 0,
+            last_selected: 0,
         }
     }
 
@@ -45,9 +53,9 @@ impl DictEntry {
         self
     }
 
-    /// Sets the selection frequency.
-    pub fn with_frequency(mut self, frequency: u32) -> Self {
-        self.frequency = frequency;
+    /// Sets the last-selected sequence number.
+    pub fn with_last_selected(mut self, last_selected: u64) -> Self {
+        self.last_selected = last_selected;
         self
     }
 }
@@ -158,7 +166,8 @@ pub trait Dictionary {
     /// Returns the operating mode of the dictionary.
     fn mode(&self) -> DictionaryMode;
 
-    /// Records the frequency of a candidate the user selected (D-36)
+    /// Records the candidate the user selected as the most recently selected
+    /// one (D-36, D-190)
     ///
     /// The default implementation returns `DictError::ReadOnlyViolation` for
     /// read-only dictionaries. Only writable dictionaries (`UserDict`) override
@@ -234,7 +243,7 @@ mod tests {
         let entry = DictEntry {
             word: "漢字".to_string(),
             annotation: Some("常用漢字".to_string()),
-            frequency: 42,
+            last_selected: 42,
         };
 
         let json = serde_json::to_string(&entry).expect("serialization failed");
@@ -252,18 +261,18 @@ mod tests {
 
         assert_eq!(restored.word, "試験");
         assert_eq!(restored.annotation, None);
-        assert_eq!(restored.frequency, 0);
+        assert_eq!(restored.last_selected, 0);
     }
 
     #[test]
     fn builder_pattern_creates_an_entry() {
         let entry = DictEntry::new("変換")
             .with_annotation("テスト用")
-            .with_frequency(10);
+            .with_last_selected(10);
 
         assert_eq!(entry.word, "変換");
         assert_eq!(entry.annotation, Some("テスト用".to_string()));
-        assert_eq!(entry.frequency, 10);
+        assert_eq!(entry.last_selected, 10);
     }
 
     #[test]
@@ -279,14 +288,34 @@ mod tests {
         assert!(msg.contains("read-only"));
     }
 
+    /// D-204 / D-195: a master dictionary built by v1.3's `sekka-dict-tool`
+    /// stores `[{"word":..,"annotation":..,"frequency":0}]` value blobs. They
+    /// must keep deserializing, and the old count is never read as a number.
     #[test]
-    fn restoring_from_json() {
-        let json = r#"{"word":"東京","annotation":"地名","frequency":100}"#;
-        let entry: DictEntry = serde_json::from_str(json).expect("deserialization failed");
+    fn a_v13_master_dictionary_blob_still_deserializes_with_last_selected_zero() {
+        let blob = r#"[{"word":"東京","annotation":null,"frequency":0}]"#;
+        let entries: Vec<DictEntry> = serde_json::from_str(blob).expect("deserialization failed");
 
-        assert_eq!(entry.word, "東京");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].word, "東京");
+        assert_eq!(entries[0].last_selected, 0);
+
+        let counted = r#"{"word":"東京","annotation":"地名","frequency":100}"#;
+        let entry: DictEntry = serde_json::from_str(counted).expect("deserialization failed");
         assert_eq!(entry.annotation, Some("地名".to_string()));
-        assert_eq!(entry.frequency, 100);
+        assert_eq!(
+            entry.last_selected, 0,
+            "an old count must never be read as a sequence number"
+        );
+    }
+
+    /// D-196: only the new key is written; the old key never comes back.
+    #[test]
+    fn entry_serializes_last_selected_and_never_frequency() {
+        let json = serde_json::to_string(&DictEntry::new("x").with_last_selected(5))
+            .expect("serialization failed");
+
+        assert_eq!(json, r#"{"word":"x","annotation":null,"last_selected":5}"#);
     }
 
     /// D-182: the master dictionary (read-only, immutable format) refuses

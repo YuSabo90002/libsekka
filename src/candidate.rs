@@ -53,8 +53,8 @@ pub struct Candidate {
     pub kind: CandidateKind,
     /// Jaro-Winkler similarity score (0.0 to 1.0).
     pub score: f64,
-    /// Selection frequency in the user dictionary.
-    pub frequency: u32,
+    /// Last-selected sequence number in the user dictionary (0 = never selected).
+    pub last_selected: u64,
     /// Candidate tier (D-96, 03.1-01). 0 = exact match and JW=1.0, 1 = SymSpell
     /// (distance 1), 2 = JW<1.0. Scores for JW<1.0 run continuously from 0.94
     /// up to just below 1.0, so placing SymSpell "after JW=1.0 and before
@@ -152,7 +152,7 @@ pub fn sort_candidates(candidates: &mut [Candidate], mode: ConversionMode) {
         group_rank(&a.kind, mode)
             .cmp(&group_rank(&b.kind, mode))
             .then_with(|| match_stage(a.tier).cmp(&match_stage(b.tier)))
-            .then_with(|| b.frequency.cmp(&a.frequency))
+            .then_with(|| b.last_selected.cmp(&a.last_selected))
             .then_with(|| a.tier.cmp(&b.tier))
             .then_with(|| {
                 b.score
@@ -186,7 +186,7 @@ pub fn build_candidates(
                 reading: reading.to_string(),
                 kind,
                 score,
-                frequency: entry.frequency,
+                last_selected: entry.last_selected,
                 tier,
                 learn_pair: Some((reading.to_string(), entry.word.clone())),
             }
@@ -205,7 +205,7 @@ pub fn hiragana_candidate(reading: &str) -> Candidate {
         reading: reading.to_string(),
         kind: CandidateKind::Hiragana,
         score: 1.0,
-        frequency: 0,
+        last_selected: 0,
         tier: 0,
         learn_pair: None,
     }
@@ -222,7 +222,7 @@ pub fn katakana_candidate(reading: &str) -> Candidate {
         reading: reading.to_string(),
         kind: CandidateKind::Katakana,
         score: 1.0,
-        frequency: 0,
+        last_selected: 0,
         tier: 0,
         learn_pair: None,
     }
@@ -238,7 +238,7 @@ pub fn alphabet_zenkaku_candidate(raw: &str) -> Candidate {
         reading: raw.to_string(),
         kind: CandidateKind::AlphabetZenkaku,
         score: 1.0,
-        frequency: 0,
+        last_selected: 0,
         tier: 0,
         learn_pair: None,
     }
@@ -254,7 +254,7 @@ pub fn alphabet_hankaku_candidate(raw: &str) -> Candidate {
         reading: raw.to_string(),
         kind: CandidateKind::AlphabetHankaku,
         score: 1.0,
-        frequency: 0,
+        last_selected: 0,
         tier: 0,
         learn_pair: None,
     }
@@ -483,7 +483,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.9,
-                frequency: 1,
+                last_selected: 1,
                 tier: 0,
                 learn_pair: None,
             },
@@ -492,7 +492,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.9,
-                frequency: 10,
+                last_selected: 10,
                 tier: 0,
                 learn_pair: None,
             },
@@ -501,7 +501,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.9,
-                frequency: 5,
+                last_selected: 5,
                 tier: 0,
                 learn_pair: None,
             },
@@ -522,7 +522,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::KanjiWithOkuri,
                 score: 0.7,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -531,7 +531,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.95,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -540,7 +540,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.85,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -566,7 +566,7 @@ mod tests {
                 reading: "Ka".to_string(),
                 kind: CandidateKind::AlphabetHankaku,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -575,7 +575,7 @@ mod tests {
                 reading: "Ka".to_string(),
                 kind: CandidateKind::AlphabetZenkaku,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -584,7 +584,7 @@ mod tests {
                 reading: "か".to_string(),
                 kind: CandidateKind::Katakana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -593,7 +593,7 @@ mod tests {
                 reading: "か".to_string(),
                 kind: CandidateKind::Hiragana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -602,7 +602,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::KanjiWithOkuri,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -611,7 +611,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -638,7 +638,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -647,7 +647,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::KanjiWithOkuri,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -656,7 +656,7 @@ mod tests {
                 reading: "Ka".to_string(),
                 kind: CandidateKind::AlphabetHankaku,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -665,7 +665,7 @@ mod tests {
                 reading: "Ka".to_string(),
                 kind: CandidateKind::AlphabetZenkaku,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -674,7 +674,7 @@ mod tests {
                 reading: "か".to_string(),
                 kind: CandidateKind::Katakana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -683,7 +683,7 @@ mod tests {
                 reading: "か".to_string(),
                 kind: CandidateKind::Hiragana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -708,7 +708,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Katakana,
                 score: 1.0,
-                frequency: 100,
+                last_selected: 100,
                 tier: 0,
                 learn_pair: None,
             },
@@ -717,7 +717,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -733,7 +733,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 100,
+                last_selected: 100,
                 tier: 0,
                 learn_pair: None,
             },
@@ -742,7 +742,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Hiragana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -766,7 +766,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -775,7 +775,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.5,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -797,7 +797,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.5,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -806,7 +806,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.9,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -824,7 +824,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Hiragana,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -833,7 +833,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.9,
-                frequency: 5,
+                last_selected: 5,
                 tier: 0,
                 learn_pair: None,
             },
@@ -842,7 +842,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.85,
-                frequency: 5,
+                last_selected: 5,
                 tier: 0,
                 learn_pair: None,
             },
@@ -879,7 +879,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 5,
+                last_selected: 5,
                 tier: 1,
                 learn_pair: None,
             },
@@ -888,7 +888,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.99,
-                frequency: 5,
+                last_selected: 5,
                 tier: 2,
                 learn_pair: None,
             },
@@ -897,7 +897,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.5,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -921,7 +921,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -930,7 +930,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.5,
-                frequency: 3,
+                last_selected: 3,
                 tier: 0,
                 learn_pair: None,
             },
@@ -939,7 +939,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -965,7 +965,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -974,7 +974,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.95,
-                frequency: 1,
+                last_selected: 1,
                 tier: 2,
                 learn_pair: None,
             },
@@ -996,7 +996,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.99,
-                frequency: 0,
+                last_selected: 0,
                 tier: 2,
                 learn_pair: None,
             },
@@ -1005,7 +1005,7 @@ mod tests {
                 reading: "かんじ".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 0.5,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -1028,7 +1028,7 @@ mod tests {
                 reading: "あと".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 1,
                 learn_pair: None,
             },
@@ -1037,7 +1037,7 @@ mod tests {
                 reading: "あと".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 1,
+                last_selected: 1,
                 tier: 1,
                 learn_pair: None,
             },
@@ -1046,7 +1046,7 @@ mod tests {
                 reading: "あと".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -1055,7 +1055,7 @@ mod tests {
                 reading: "あと".to_string(),
                 kind: CandidateKind::Kanji,
                 score: 1.0,
-                frequency: 0,
+                last_selected: 0,
                 tier: 0,
                 learn_pair: None,
             },
@@ -1069,7 +1069,7 @@ mod tests {
     fn candidates_are_built_from_dictionary_entries() {
         let entries = vec![
             DictEntry::new("漢字"),
-            DictEntry::new("感じる").with_frequency(3),
+            DictEntry::new("感じる").with_last_selected(3),
         ];
 
         let candidates = build_candidates("かんじ", &entries, 0.9, 0);
@@ -1079,11 +1079,11 @@ mod tests {
         assert_eq!(candidates[0].reading, "かんじ");
         assert_eq!(candidates[0].kind, CandidateKind::Kanji);
         assert_eq!(candidates[0].score, 0.9);
-        assert_eq!(candidates[0].frequency, 0);
+        assert_eq!(candidates[0].last_selected, 0);
 
         assert_eq!(candidates[1].display, "感じる");
         assert_eq!(candidates[1].kind, CandidateKind::KanjiWithOkuri);
-        assert_eq!(candidates[1].frequency, 3);
+        assert_eq!(candidates[1].last_selected, 3);
     }
 
     #[test]
@@ -1094,7 +1094,7 @@ mod tests {
         assert_eq!(candidate.reading, "かんじ");
         assert_eq!(candidate.kind, CandidateKind::Hiragana);
         assert_eq!(candidate.score, 1.0);
-        assert_eq!(candidate.frequency, 0);
+        assert_eq!(candidate.last_selected, 0);
     }
 
     #[test]
@@ -1105,7 +1105,7 @@ mod tests {
         assert_eq!(candidate.reading, "かんじ");
         assert_eq!(candidate.kind, CandidateKind::Katakana);
         assert_eq!(candidate.score, 1.0);
-        assert_eq!(candidate.frequency, 0);
+        assert_eq!(candidate.last_selected, 0);
     }
 
     #[test]
@@ -1123,13 +1123,13 @@ mod tests {
         assert_eq!(hankaku.display, "kanJi");
         assert_eq!(hankaku.kind, CandidateKind::AlphabetHankaku);
         assert_eq!(hankaku.score, 1.0);
-        assert_eq!(hankaku.frequency, 0);
+        assert_eq!(hankaku.last_selected, 0);
 
         let zenkaku = alphabet_zenkaku_candidate("kanJi");
         assert_eq!(zenkaku.display, "ｋａｎＪｉ");
         assert_eq!(zenkaku.kind, CandidateKind::AlphabetZenkaku);
         assert_eq!(zenkaku.score, 1.0);
-        assert_eq!(zenkaku.frequency, 0);
+        assert_eq!(zenkaku.last_selected, 0);
     }
 
     #[test]
