@@ -41,8 +41,8 @@ pub enum CandidateKind {
 /// Conversion candidate
 ///
 /// One conversion candidate obtained from a dictionary lookup. It holds the
-/// display string, the reading, the kind, the similarity score and the selection
-/// frequency.
+/// display string, the reading, the kind, the similarity score and the
+/// last-selected sequence number (MRU, D-191).
 #[derive(Debug, Clone)]
 pub struct Candidate {
     /// The string to display (e.g. "漢字").
@@ -53,7 +53,9 @@ pub struct Candidate {
     pub kind: CandidateKind,
     /// Jaro-Winkler similarity score (0.0 to 1.0).
     pub score: f64,
-    /// Last-selected sequence number in the user dictionary (0 = never selected).
+    /// The user dictionary's last-selected sequence number (D-190): a larger number
+    /// means the word was selected more recently. 0 for unlearned and generated
+    /// candidates.
     pub last_selected: u64,
     /// Candidate tier (D-96, 03.1-01). 0 = exact match and JW=1.0, 1 = SymSpell
     /// (distance 1), 2 = JW<1.0. Scores for JW<1.0 run continuously from 0.94
@@ -63,11 +65,12 @@ pub struct Candidate {
     ///
     /// `sort_candidates` derives the match stage from this value with
     /// `match_stage` (D-144: tier 0 -> stage 0, tiers 1 and 2 -> stage 1) and
-    /// compares the stage before frequency, replacing D-96's "frequency before
+    /// compares the stage before `last_selected`, replacing D-96's "frequency before
     /// tier" (03.1-01) so a fuzzy candidate learned under a different reading
     /// can no longer outrank an unlearned exact match (RANK-01). `tier` itself
-    /// is still compared after frequency, inside the fuzzy stage, so a learned
-    /// tier-2 candidate keeps outranking an unlearned tier-1 one (D-146).
+    /// is still compared after `last_selected` (D-191, Phase 12), inside the fuzzy
+    /// stage, so a learned tier-2 candidate keeps outranking an unlearned tier-1
+    /// one (D-146).
     /// Generated candidates (hiragana, katakana, full-width and half-width
     /// alphabet) are always `0`, but never take part in the stage comparison:
     /// `group_rank` already separates them from dictionary candidates before
@@ -138,14 +141,15 @@ pub(crate) fn match_stage(tier: u8) -> u8 {
 ///    candidate has been learned. D-96 (Phase 03.1) used to compare frequency
 ///    before tier, which let a fuzzy candidate learned under a different
 ///    reading overtake an unlearned exact match (RANK-01); D-144 (Phase 8)
-///    replaces that by inserting this stage ahead of frequency.
-/// 3. selection frequency (descending) - only effective within one stage, so a
-///    learned candidate still wins inside the exact-match stage (RANK-02) and
-///    inside the fuzzy stage (D-145)
+///    replaces that by inserting this stage ahead of the learning order.
+/// 3. last-selected sequence number (descending, D-191) - the most recently selected
+///    word leads its stage; unlearned candidates (0) keep tier -> score -> dictionary
+///    order. Only effective within one stage, so a learned candidate still wins
+///    inside the exact-match stage (RANK-02) and inside the fuzzy stage (D-145)
 /// 4. tier (ascending) - exact match/JW=1.0 (0) -> SymSpell (1) -> JW<1.0 (2).
 ///    Only breaks ties within the fuzzy stage, where tier 1 and tier 2 already
 ///    share the same stage value (D-146: a learned tier-2 candidate still
-///    outranks an unlearned tier-1 one, because frequency is compared first)
+///    outranks an unlearned tier-1 one, because last_selected is compared first)
 /// 5. similarity score (descending) - only effective within one tier
 pub fn sort_candidates(candidates: &mut [Candidate], mode: ConversionMode) {
     candidates.sort_by(|a, b| {
@@ -197,8 +201,8 @@ pub fn build_candidates(
 /// Builds the hiragana fallback candidate
 ///
 /// Returns the reading itself as a hiragana candidate when the dictionary has no
-/// matching conversion candidate. The score is 1.0 (an exact match) and the
-/// frequency is 0.
+/// matching conversion candidate. The score is 1.0 (an exact match) and
+/// `last_selected` is 0.
 pub fn hiragana_candidate(reading: &str) -> Candidate {
     Candidate {
         display: reading.to_string(),
@@ -214,7 +218,7 @@ pub fn hiragana_candidate(reading: &str) -> Candidate {
 /// Builds the katakana candidate
 ///
 /// Converts a hiragana reading to katakana and builds a candidate from it. The
-/// score is 1.0 (an exact match) and the frequency is 0.
+/// score is 1.0 (an exact match) and `last_selected` is 0.
 pub fn katakana_candidate(reading: &str) -> Candidate {
     let katakana = hiragana_to_katakana(reading);
     Candidate {
@@ -231,7 +235,7 @@ pub fn katakana_candidate(reading: &str) -> Candidate {
 /// Builds the full-width alphabet candidate (D-05)
 ///
 /// Displays the romaji buffer as typed (preserving case) converted to full-width
-/// characters. The score is 1.0 (an exact match) and the frequency is 0.
+/// characters. The score is 1.0 (an exact match) and `last_selected` is 0.
 pub fn alphabet_zenkaku_candidate(raw: &str) -> Candidate {
     Candidate {
         display: ascii_to_fullwidth(raw),
@@ -247,7 +251,7 @@ pub fn alphabet_zenkaku_candidate(raw: &str) -> Candidate {
 /// Builds the half-width alphabet candidate (D-05)
 ///
 /// Displays the romaji buffer as typed (preserving case), unchanged. The score is
-/// 1.0 (an exact match) and the frequency is 0.
+/// 1.0 (an exact match) and `last_selected` is 0.
 pub fn alphabet_hankaku_candidate(raw: &str) -> Candidate {
     Candidate {
         display: raw.to_string(),
@@ -476,7 +480,7 @@ mod tests {
     }
 
     #[test]
-    fn sorting_by_frequency() {
+    fn sorting_by_last_selected() {
         let mut candidates = vec![
             Candidate {
                 display: "漢字A".to_string(),
@@ -700,8 +704,8 @@ mod tests {
     }
 
     #[test]
-    fn frequency_never_crosses_groups() {
-        // With uppercase, a Katakana candidate with frequency 100 still comes after a Kanji one with frequency 0.
+    fn last_selected_never_crosses_groups() {
+        // With uppercase, a Katakana candidate with last_selected 100 still comes after a Kanji one with last_selected 0.
         let mut candidates = vec![
             Candidate {
                 display: "カンジ".to_string(),
@@ -726,7 +730,7 @@ mod tests {
         assert_eq!(candidates[0].kind, CandidateKind::Kanji);
         assert_eq!(candidates[1].kind, CandidateKind::Katakana);
 
-        // All lowercase: a Kanji candidate with frequency 100 comes after a Hiragana one with frequency 0.
+        // All lowercase: a Kanji candidate with last_selected 100 comes after a Hiragana one with last_selected 0.
         let mut candidates2 = vec![
             Candidate {
                 display: "漢字".to_string(),
@@ -753,13 +757,13 @@ mod tests {
     }
 
     #[test]
-    fn a_lower_tier_wins_and_is_compared_between_frequency_and_score() {
+    fn a_lower_tier_wins_and_is_compared_between_last_selected_and_score() {
         // Under D-144 (Phase 8, replacing D-96's "frequency before tier"), the
-        // match stage (`match_stage(tier)`) is compared before frequency, and
-        // `tier` itself is still compared after frequency and before score.
-        // Here both candidates have the same frequency (0), so D-96 and D-144
+        // match stage (`match_stage(tier)`) is compared before last_selected, and
+        // `tier` itself is still compared after last_selected and before score.
+        // Here both candidates have the same last_selected (0), so D-96 and D-144
         // produce the same result: a tier-1 candidate still loses to a tier-0
-        // one even with a higher score (same group, same frequency).
+        // one even with a higher score (same group, same last_selected).
         let mut candidates = vec![
             Candidate {
                 display: "SymSpell候補".to_string(),
@@ -850,7 +854,7 @@ mod tests {
 
         sort_candidates(&mut candidates, ConversionMode::KanjiConvert);
 
-        // The frequency-5 candidates come first, ordered by score among themselves.
+        // The last_selected-5 candidates come first, ordered by score among themselves.
         assert_eq!(candidates[0].display, "漢字");
         assert_eq!(candidates[1].display, "幹事");
         assert_eq!(candidates[2].display, "かんじ");
@@ -871,7 +875,7 @@ mod tests {
         // RANK-01 / D-144: no amount of learning on a fuzzy candidate (tier 1
         // or 2) should let it outrank an unlearned exact match (tier 0). This
         // is the regression this phase fixes - under D-96 (frequency before
-        // tier), the SymSpell candidate's frequency of 5 would have put it
+        // tier), the SymSpell candidate's learning (last_selected 5) would have put it
         // ahead of the unlearned exact match.
         let mut candidates = vec![
             Candidate {
@@ -954,10 +958,10 @@ mod tests {
     fn a_learned_tier_2_candidate_outranks_an_unlearned_tier_1_candidate() {
         // D-146: tier 1 and tier 2 share the same match stage, so a learned
         // tier-2 candidate (JW<1.0) still outranks an unlearned tier-1 one
-        // (SymSpell) - frequency is compared before tier. Implementing the
+        // (SymSpell) - last_selected is compared before tier. Implementing the
         // stage as a 3-value comparison on `tier` itself (instead of the
         // 2-value `match_stage`) would make this test fail: tier 1 would
-        // always sort ahead of tier 2 regardless of frequency (08-RESEARCH.md
+        // always sort ahead of tier 2 regardless of last_selected (08-RESEARCH.md
         // Pitfall 3).
         let mut candidates = vec![
             Candidate {
@@ -986,7 +990,7 @@ mod tests {
 
     #[test]
     fn unlearned_fuzzy_candidates_keep_tier_1_before_tier_2() {
-        // D-146 / D-148: with no learning on either side (equal frequency),
+        // D-146 / D-148: with no learning on either side (equal last_selected),
         // the fuzzy stage falls back to comparing `tier` before `score`, so
         // tier 1 (SymSpell) still comes before tier 2 (JW<1.0) even when
         // tier 2 has the higher score.
@@ -1018,7 +1022,7 @@ mod tests {
     #[test]
     fn a_learned_fuzzy_candidate_leads_the_fuzzy_stage_behind_every_exact_match() {
         // D-145 (a copy of the Ato example from context.rs): a fuzzy
-        // candidate learned under another reading (元, tier 1, frequency 1)
+        // candidate learned under another reading (元, tier 1, last_selected 1)
         // leads the fuzzy stage - ahead of the unlearned tier-1 candidate
         // (基) - but stays behind every exact match (後/跡, tier 0), no
         // matter how much it has been learned.
