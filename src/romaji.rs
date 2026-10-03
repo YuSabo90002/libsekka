@@ -670,8 +670,9 @@ mod tests {
     ];
 
     // Inputs whose output a later decision changed on purpose. Every input here
-    // must also be in LEGACY_RULES.
-    const CHANGED_RULES: [(&str, &str); 0] = [];
+    // must also be in LEGACY_RULES. D-206: wi and we move from the old wyi/wye
+    // kana to the usual u + small i/e; the old kana are typed with yi, wyi and wye.
+    const CHANGED_RULES: [(&str, &str); 2] = [("wi", "うぃ"), ("we", "うぇ")];
 
     #[test]
     fn is_strictly_convertible_boundary_cases() {
@@ -908,8 +909,9 @@ mod tests {
             "rule_map is built with HashMap::insert, so a duplicated input would \
              silently drop the earlier rule (D-209)"
         );
-        // 151 (v1.3 table) + 5 (V row, D-205)
-        assert_eq!(conv.rules.len(), 156);
+        // 151 (v1.3 table) + 46 (D-205): 16 -ye, 13 -yi, 6 W row (whi whe who yi
+        // wyi wye), 5 V row, 4 small kana (lya lyu lyo lwa), 2 (thu dhu)
+        assert_eq!(conv.rules.len(), 197);
     }
 
     #[test]
@@ -938,5 +940,167 @@ mod tests {
         // Uppercase input is lowered by feed, so the same rules apply.
         assert_eq!(convert("Va"), convert("va"));
         assert_eq!(convert("Vu"), convert("vu"));
+    }
+
+    #[test]
+    fn ye_youon_spellings_produce_small_e_youon() {
+        // ROMA-01 / D-205: the 16 -ye spellings.
+        for (input, expected) in [
+            ("che", "ちぇ"),
+            ("tye", "ちぇ"),
+            ("she", "しぇ"),
+            ("sye", "しぇ"),
+            ("je", "じぇ"),
+            ("jye", "じぇ"),
+            ("zye", "じぇ"),
+            ("dye", "ぢぇ"),
+            ("kye", "きぇ"),
+            ("gye", "ぎぇ"),
+            ("nye", "にぇ"),
+            ("hye", "ひぇ"),
+            ("bye", "びぇ"),
+            ("pye", "ぴぇ"),
+            ("mye", "みぇ"),
+            ("rye", "りぇ"),
+            // feed lowercases, so a leading capital changes nothing.
+            ("Tye", "ちぇ"),
+            // "n" followed by "y" must not become "ん" (it is the nye rule).
+            ("kanye", "かにぇ"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn w_series_rules_and_the_new_spellings_of_wi_and_we() {
+        // ROMA-03 / D-205 / D-206: wi and we change; the old wi/we kana move to
+        // yi, wyi and wye.
+        for (input, expected) in [
+            ("whi", "うぃ"),
+            ("wi", "うぃ"),
+            ("whe", "うぇ"),
+            ("we", "うぇ"),
+            ("who", "うぉ"),
+            ("yi", "ゐ"),
+            ("wyi", "ゐ"),
+            ("wye", "ゑ"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn yi_series_produces_small_i_youon() {
+        // ROMA-04 / D-205: the 13 -yi spellings (tyi and dyi follow ddskk, libskk
+        // and Mozc rather than upstream's outliers).
+        for (input, expected) in [
+            ("kyi", "きぃ"),
+            ("gyi", "ぎぃ"),
+            ("syi", "しぃ"),
+            ("zyi", "じぃ"),
+            ("jyi", "じぃ"),
+            ("tyi", "ちぃ"),
+            ("dyi", "ぢぃ"),
+            ("nyi", "にぃ"),
+            ("hyi", "ひぃ"),
+            ("byi", "びぃ"),
+            ("pyi", "ぴぃ"),
+            ("myi", "みぃ"),
+            ("ryi", "りぃ"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn thu_dhu_produce_teyu_and_deyu() {
+        // ROMA-04 / D-205: follows ddskk, libskk and Mozc rather than upstream's
+        // te + small u and de + small u.
+        assert_eq!(convert("thu"), "てゅ");
+        assert_eq!(convert("dhu"), "でゅ");
+    }
+
+    #[test]
+    fn l_small_lya_lyu_lyo_lwa_produce_small_kana() {
+        // ROMA-05 / D-205. lyi is not in D-205 and is not added.
+        assert_eq!(convert("lya"), "ゃ");
+        assert_eq!(convert("lyu"), "ゅ");
+        assert_eq!(convert("lyo"), "ょ");
+        assert_eq!(convert("lwa"), "ゎ");
+    }
+
+    #[test]
+    fn sokuon_reaches_the_new_rules_through_the_generic_rule() {
+        // D-208: no sokuon-specific rule rows; the repeated-consonant handling in
+        // try_convert already turns the first letter into a small tsu.
+        for (input, expected) in [
+            ("ttye", "っちぇ"),
+            ("jje", "っじぇ"),
+            ("vva", "っ\u{3046}\u{309B}\u{3041}"),
+            ("wwhe", "っうぇ"),
+            ("ccha", "っちゃ"),
+            ("ddyu", "っぢゅ"),
+            // v waits for the next character and comes out as it is on flush.
+            ("vv", "っv"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn rules_left_out_keep_their_current_output() {
+        // D-208 / D-209 / ROMA-06 / ROMA-F1: spellings that are deliberately not
+        // added keep today's output. dyu stays ぢゅ (no duplicate rule).
+        for (input, expected) in [
+            ("dyu", "ぢゅ"),
+            ("dya", "ぢゃ"),
+            ("dyo", "ぢょ"),
+            ("ca", "cあ"),
+            ("ce", "cえ"),
+            ("ci", "cい"),
+            ("cye", "cyえ"),
+            ("wha", "wは"),
+            ("whu", "wふ"),
+            ("ye", "yえ"),
+            ("wo", "を"),
+            ("thi", "てぃ"),
+            ("dhi", "でぃ"),
+            ("tha", "tは"),
+            ("xwa", "ゎ"),
+            ("nnye", "んyえ"),
+            ("n'ye", "んyえ"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn words_spelled_with_the_new_rules_convert_as_intended() {
+        // D-210: the prefix match widens with the new rules, so some English words
+        // now convert (D-212 accepts this; the half-width alphabet stays
+        // selectable). vim still ends in a bare m and is not strictly convertible.
+        for (input, expected) in [
+            ("java", "じゃ\u{3046}\u{309B}\u{3041}"),
+            ("live", "ぃ\u{3046}\u{309B}\u{3047}"),
+            ("video", "\u{3046}\u{309B}\u{3043}でお"),
+            ("vim", "\u{3046}\u{309B}\u{3043}m"),
+            ("wine", "うぃね"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+        for (input, expected) in [
+            ("java", true),
+            ("live", true),
+            ("video", true),
+            ("she", true),
+            ("vim", false),
+        ] {
+            assert_eq!(
+                is_strictly_convertible(input),
+                expected,
+                "input={:?}",
+                input
+            );
+        }
     }
 }
