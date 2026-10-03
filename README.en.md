@@ -39,8 +39,9 @@ reach the intended word.
 - Immutable master dictionary format: a single read-only file, mmapped, sorted by key and
   binary-searched, with a romaji prefix index and a SymSpell delete-variant index bundled in
   (`FORMAT_VERSION = 2`). The whole of SKK-JISYO.L is 175,789 keys / about 21.7 MB.
-- User dictionary: backed by sled. It records the frequency of committed candidates and
-  reflects that in later orderings.
+- User dictionary: backed by sled. It records a dictionary-wide sequence number for the most
+  recently selected candidate and puts the most recently selected word first within each
+  stage (exact matches, then fuzzy matches) — MRU. Word registration uses the same record.
 - No external server is contacted during conversion (there is no equivalent of upstream's
   sekka-server).
 
@@ -77,6 +78,42 @@ same dictionary open, because of sled's exclusive lock):
 ```sh
 ./target/release/sekka-dict-tool dump ~/.local/share/fcitx5/sekka/user-dict.db
 ```
+
+The output is three tab-separated columns: reading, word, and the sequence number of the
+last selection. `dump` neither migrates nor rewrites the dictionary, so dumping a v1.3 (or
+earlier) dictionary as it is shows 0 in every third column. The output contains your input
+history (readings and words) in plain text, so do not paste it into a shared place.
+
+## Upgrading to v1.4
+
+In v1.4 learning changed from a selection count (up to v1.3) to most-recently-selected
+order. The user dictionary format changed with it, so read this before you update.
+
+- **The migration happens once, automatically.** A v1.3 (or earlier) user dictionary is
+  migrated to the new format on the first start of v1.4, and the order of the candidates for
+  each reading is preserved. The migration prints nothing.
+- **Downgrading is not supported.** A user dictionary in the new format cannot be read by a
+  v1.3 (or earlier) binary. If you go back to v1.3 or earlier, for example by rolling back a
+  NixOS generation, the user dictionary lives outside the Nix store and stays in the new
+  format, so learning and the words you registered stop working.
+- **No backup copy is made automatically.** Nothing is saved before the migration, so before
+  updating to v1.4, quit fcitx5 and copy `user-dict.db` by hand:
+
+  ```sh
+  cp -a ~/.local/share/fcitx5/sekka/user-dict.db ~/.local/share/fcitx5/sekka/user-dict.db.v1.3-backup
+  ```
+
+  If you set `XDG_DATA_HOME`, use `$XDG_DATA_HOME/fcitx5/sekka/`; if you changed the user
+  dictionary path in the settings, use `user-dict.db` at that path. To go back to v1.3 or
+  earlier, quit fcitx5, move the new-format `user-dict.db` aside, and restore the copy under
+  the original name. Without the copy, learning and registered words are not available. The
+  copy also holds your input history in plain text, so do not leave it in a shared place.
+- **The master dictionary is incompatible in one direction too.** A `master-dict.db` built
+  with the v1.3 `sekka-dict-tool` is read by v1.4 as it is, so you do not need to rebuild
+  it. A `master-dict.db` rebuilt with the v1.4 `sekka-dict-tool convert` cannot be read by a
+  v1.3 (or earlier) binary (a lookup returns only the generated candidates such as hiragana
+  and katakana). When you go back to v1.3 or earlier, use a `master-dict.db` built with the
+  v1.3 tool.
 
 ## License
 
