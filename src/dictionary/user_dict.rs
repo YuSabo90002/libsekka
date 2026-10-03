@@ -162,9 +162,11 @@ impl UserDict {
     /// key does three things: each key that is UTF-8 is passed to
     /// `MemoryRomanIndex::insert` and the SymSpell index; each value is read as
     /// `StoredEntry`s to find the highest sequence number in use (the start of
-    /// `last_seq`, D-190) and the legacy elements. Keys that are not UTF-8 (or that
-    /// fail to read) and values that are not JSON are skipped - never removed or
-    /// rewritten - so a damaged user dictionary does not fail the whole `open`.
+    /// `last_seq`, D-190) and the legacy elements. Keys that are not UTF-8 and
+    /// values that are not JSON are skipped - never removed or rewritten - so a
+    /// damaged user dictionary does not fail the whole `open`. A read error from
+    /// sled itself is different: the scan decides the sequence base and what gets
+    /// migrated, so it is returned as `DictError::BackendError` rather than skipped.
     ///
     /// When `migrate` is true and some element is legacy (it has a count and no
     /// sequence number - decided by the shape of the value alone, with no external
@@ -196,7 +198,10 @@ impl UserDict {
         let mut symspell_index = MemorySymSpellIndex::new();
         let mut base: u64 = 0;
         let mut rows: Vec<(String, Vec<StoredEntry>)> = Vec::new();
-        for (key, value) in db.iter().flatten() {
+        for item in db.iter() {
+            // A sled read error is not a row to skip: `base` and the migration
+            // depend on this scan seeing every row, so it fails the open.
+            let (key, value) = item.map_err(DictError::BackendError)?;
             let Ok(reading) = std::str::from_utf8(&key) else {
                 continue;
             };
