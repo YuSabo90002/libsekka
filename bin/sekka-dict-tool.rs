@@ -21,7 +21,9 @@
 //! as an error and the tool exits non-zero.
 
 use sekka::dictionary::dict_format;
+use sekka::dictionary::user_dict::UserDict;
 use sekka::dictionary::DictEntry;
+use sekka::dictionary::DictError;
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::process;
@@ -35,7 +37,7 @@ fn print_usage() {
     eprintln!();
     eprintln!("Subcommands:");
     eprintln!("  convert    convert from the SKK-JISYO format into the immutable master dictionary format");
-    eprintln!("  dump       print the contents of a user dictionary (reading, word, frequency) as tab-separated columns");
+    eprintln!("  dump       print the contents of a user dictionary (reading, word, last-selected sequence number) as tab-separated columns");
     eprintln!();
     eprintln!("Options:");
     eprintln!("  --output, -o <path>    path of the dictionary file to write");
@@ -51,14 +53,18 @@ fn print_usage() {
     eprintln!(
         "  It cannot run while fcitx5 has the same user dictionary open (sled's single-process exclusive lock)."
     );
+    eprintln!("  It never rewrites or migrates the dictionary: entries written by v1.3 or earlier show 0 in the third column.");
     eprintln!("  The output contains words the user typed in plain text, so do not paste it anywhere shared.");
 }
 
-/// Formats a reading, word and frequency as one line of three tab-separated columns (D-101)
+/// Formats a reading, word and last-selected sequence number as one line of three
+/// tab-separated columns (D-101)
 ///
-/// The `annotation` is not printed. SC2 asks about the reading, the word and the
-/// frequency; adding columns would make the E2E-side parsing depend on whether an
-/// annotation is present.
+/// The third column is the sequence number of the entry's most recent selection
+/// (D-190); the larger it is, the more recently the word was chosen. `dump` does not
+/// migrate, so an entry written by v1.3 or earlier still shows 0 here (Claude's
+/// Discretion). The `annotation` is not printed: adding columns would make the
+/// E2E-side parsing depend on whether an annotation is present.
 fn format_dump_line(reading: &str, entry: &DictEntry) -> String {
     format!("{}\t{}\t{}", reading, entry.word, entry.last_selected)
 }
@@ -74,17 +80,33 @@ fn open_for_dump(
     sekka::dictionary::user_dict::UserDict::open_with(path, false)
 }
 
-/// Opens a user dictionary read-only and prints every entry to stdout as three
-/// tab-separated columns (D-101)
+/// Builds the `dump` output lines of an opened user dictionary, one per entry (D-101)
 ///
-/// It calls no API other than `open_for_dump` and `Dictionary::prefix_search`
-/// (T-04-03-02: dump must not modify the user dictionary).
+/// It only reads: `Dictionary::prefix_search("")` walks every reading and
+/// `format_dump_line` lays each entry out. Readings come in key order and the
+/// entries of one reading in lookup order (most recently selected first).
+fn dump_lines(dict: &UserDict) -> Result<Vec<String>, DictError> {
+    let results = sekka::dictionary::Dictionary::prefix_search(dict, "")?;
+    let mut lines = Vec::new();
+    for (reading, entries) in results {
+        for entry in entries {
+            lines.push(format_dump_line(&reading, &entry));
+        }
+    }
+    Ok(lines)
+}
+
+/// Opens a user dictionary without writing to it and prints every entry to stdout
+/// as three tab-separated columns (D-101)
+///
+/// It calls no API other than `open_for_dump` and `dump_lines`
+/// (T-04-03-02: dump must not modify or migrate the user dictionary).
 ///
 /// When `open_for_dump` fails, it prints the `Display` of `DictError` plus a note
 /// that fcitx5 may be using the file and exits on the spot (rather than layering
 /// error handling in the caller), because sled's single-process exclusive lock
 /// (`fs2::FileExt::try_lock_exclusive`, non-blocking) is inherently hit while
-/// fcitx5 has the same user dictionary open. When `prefix_search` fails, the
+/// fcitx5 has the same user dictionary open. When `dump_lines` fails, the
 /// `DictError` is returned to the caller as it is (with no note, since the cause
 /// is something other than lock contention).
 fn dump(path: &str) -> Result<(), sekka::dictionary::DictError> {
@@ -97,11 +119,8 @@ fn dump(path: &str) -> Result<(), sekka::dictionary::DictError> {
         }
     };
 
-    let results = sekka::dictionary::Dictionary::prefix_search(&dict, "")?;
-    for (reading, entries) in results {
-        for entry in entries {
-            println!("{}", format_dump_line(&reading, &entry));
-        }
+    for line in dump_lines(&dict)? {
+        println!("{}", line);
     }
 
     Ok(())
@@ -436,7 +455,7 @@ fn main() {
             }
 
             // dump itself calls process::exit directly when open_for_dump fails,
-            // so the only Err that reaches here comes from prefix_search.
+            // so the only Err that reaches here comes from dump_lines.
             if let Err(e) = dump(&args[2]) {
                 eprintln!("error: {}", e);
                 process::exit(1);
@@ -784,21 +803,49 @@ mod tests {
     }
 
     /// Output formatting of the `dump` subcommand (D-101): the reading, word and
-    /// frequency as three tab-separated columns. The expected value is pinned
-    /// verbatim.
+    /// last-selected sequence number as three tab-separated columns. The expected
+    /// value is pinned verbatim.
     #[test]
-    fn format_dump_line_lays_out_reading_word_and_frequency_tab_separated() {
+    fn format_dump_line_lays_out_reading_word_and_last_selected_tab_separated() {
         let entry = DictEntry::new("幹事").with_last_selected(3);
         let line = format_dump_line("かんじ", &entry);
         assert_eq!(line, "かんじ\t幹事\t3");
     }
 
-    /// Confirms `dump` can walk every entry without modifying the user dictionary
-    /// (D-101 / T-04-03-02). It checks directly that the result of
-    /// `prefix_search("")` is identical before and after the call.
+    /// Every raw `(key, value)` pair of the sled database at `path`, in key order.
+    fn raw_snapshot(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let db = sled::open(path).expect("failed to open the raw sled database");
+        db.iter()
+            .map(|pair| {
+                let (key, value) = pair.expect("failed to read a raw pair");
+                (key.to_vec(), value.to_vec())
+            })
+            .collect()
+    }
+
+    /// Writes a v1.3-shaped user dictionary (`word, annotation, frequency`) directly
+    /// with sled, the way v1.3 left it on disk: かんじ [漢字 f=1, 幹事 f=5], かんj [感 f=2].
+    fn write_v13_user_dict(path: &Path) {
+        let db = sled::open(path).expect("failed to create the raw sled database");
+        db.insert(
+            "かんじ".as_bytes(),
+            r#"[{"word":"漢字","annotation":null,"frequency":1},{"word":"幹事","annotation":null,"frequency":5}]"#
+                .as_bytes(),
+        )
+        .expect("the direct write failed");
+        db.insert(
+            "かんj".as_bytes(),
+            r#"[{"word":"感","annotation":null,"frequency":2}]"#.as_bytes(),
+        )
+        .expect("the direct write failed");
+        db.flush().expect("flush failed");
+    }
+
+    /// Confirms `dump` can walk every entry without modifying a v1.4 user
+    /// dictionary (D-101 / T-04-03-02). It compares the raw bytes of every key
+    /// before and after calling the production `dump`.
     #[test]
     fn dump_walks_every_entry_without_writing() {
-        use sekka::dictionary::user_dict::UserDict;
         use sekka::dictionary::Dictionary;
 
         let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
@@ -815,20 +862,67 @@ mod tests {
             dict.save().expect("save failed");
         }
 
-        let before = {
-            let dict = UserDict::open(&db_path).expect("failed to reopen the user dictionary");
-            Dictionary::prefix_search(&dict, "").expect("prefix_search failed")
-        };
+        let before = raw_snapshot(&db_path);
+        assert_eq!(before.len(), 2, "two readings were recorded");
 
         let result = dump(db_path.to_str().unwrap());
         assert!(result.is_ok(), "dump should return Ok(()): {:?}", result);
 
-        let after = {
-            let dict =
-                UserDict::open(&db_path).expect("failed to open the user dictionary a third time");
-            Dictionary::prefix_search(&dict, "").expect("prefix_search failed")
-        };
+        assert_eq!(
+            raw_snapshot(&db_path),
+            before,
+            "the raw bytes must not change across dump"
+        );
+    }
 
-        assert_eq!(before, after, "the entries must not change across dump");
+    /// `dump` neither migrates nor rewrites a v1.3 user dictionary (D-197): the raw
+    /// bytes are equal before and after the production `dump`, and every line shows
+    /// 0 in the third column because the old counts are not sequence numbers.
+    #[test]
+    fn dump_leaves_a_v13_dictionary_byte_for_byte_unchanged() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let db_path = tmp.path().join("user-dict.db");
+        write_v13_user_dict(&db_path);
+
+        let before = raw_snapshot(&db_path);
+        assert_eq!(before.len(), 2);
+
+        let result = dump(db_path.to_str().unwrap());
+        assert!(result.is_ok(), "dump should return Ok(()): {:?}", result);
+        assert_eq!(
+            raw_snapshot(&db_path),
+            before,
+            "dump must not migrate or rewrite a v1.3 dictionary"
+        );
+
+        let dict = open_for_dump(db_path.to_str().unwrap()).expect("failed to open for dump");
+        let lines = dump_lines(&dict).expect("dump_lines failed");
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(
+            lines.iter().all(|line| line.ends_with("\t0")),
+            "a v1.3 entry shows 0 in the third column: {lines:?}"
+        );
+    }
+
+    /// After the migration (which only `UserDict::open` performs) `dump_lines` prints
+    /// each element's last-selected sequence number as the third column, in the
+    /// order the readings and elements come out of `prefix_search`.
+    #[test]
+    fn dump_lines_print_last_selected_for_a_migrated_dictionary() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let db_path = tmp.path().join("user-dict.db");
+        write_v13_user_dict(&db_path);
+
+        drop(UserDict::open(&db_path).expect("failed to open (migrating)"));
+
+        let dict = open_for_dump(db_path.to_str().unwrap()).expect("failed to open for dump");
+        assert_eq!(
+            dump_lines(&dict).expect("dump_lines failed"),
+            vec![
+                "かんj\t感\t2".to_string(),
+                "かんじ\t幹事\t3".to_string(),
+                "かんじ\t漢字\t1".to_string(),
+            ]
+        );
     }
 }
