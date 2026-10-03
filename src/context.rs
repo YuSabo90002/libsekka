@@ -580,8 +580,8 @@ impl SekkaContext {
     /// is `Some`, this context's own `last_commit` is frozen (the candidate that
     /// was staged right before Ctrl-R, D-179/D-181) and must not be committed or
     /// learned through this path. Word registration writes through
-    /// `finish_registration` -> `Dictionary::record_registration` instead (D-182),
-    /// never through here - this keeps D-34/D-37's single learning exit intact.
+    /// `finish_registration` -> `Dictionary::record_selection` (D-194) instead,
+    /// never through here - this keeps D-34/D-37's learning exits at exactly two.
     /// The capi dispatch routes registration-mode keys to `active_mut()`, so this
     /// context's own `flush_last_commit` should never be reachable while
     /// registering; this guard is a defense in depth in case that routing is ever
@@ -631,7 +631,7 @@ impl SekkaContext {
         self.state
     }
 
-    // === Word registration (D-167/D-170/D-171/D-172/D-182, Phase 10) ===
+    // === Word registration (D-167/D-170/D-171/D-172/D-194, Phase 10/12) ===
 
     /// Returns whether a word-registration session is active (Ctrl-R was
     /// pressed and no Enter has finished it yet)
@@ -720,7 +720,9 @@ impl SekkaContext {
     /// that (REG-05 - nothing was ever typed) leaves the session in place and
     /// returns false, so an empty Enter does not silently exit registration.
     /// Otherwise this step is consumed: the reading/word pair is recorded
-    /// into the first `ReadWrite` dictionary (D-182), that dictionary is
+    /// into the first `ReadWrite` dictionary with the same `record_selection`
+    /// as an ordinary commit (D-194, Phase 12; v1.3's D-182 was a separate
+    /// "maximum + 1" write), that dictionary is
     /// asked to `save()` immediately (Claude's Discretion - persist a
     /// registration right away rather than waiting for an explicit save
     /// request), this context's own frozen candidate is discarded without
@@ -728,7 +730,7 @@ impl SekkaContext {
     /// becomes this context's committed output (D-172: only the outermost
     /// step's Enter ever reaches the application, because only the outermost
     /// step calls `poll_output`/its `committed_output` is what capi reads).
-    /// Both the `record_registration` and the `save` failure are ignored
+    /// Both the `record_selection` and the `save` failure are ignored
     /// (D-35: a recording failure never blocks the commit, the same
     /// discipline as `flush_last_commit`).
     ///
@@ -766,7 +768,7 @@ impl SekkaContext {
             .iter()
             .find(|d| d.mode() == DictionaryMode::ReadWrite)
         {
-            if dict.record_registration(&reading, &word).is_ok() {
+            if dict.record_selection(&reading, &word).is_ok() {
                 let _ = dict.save();
             }
         }

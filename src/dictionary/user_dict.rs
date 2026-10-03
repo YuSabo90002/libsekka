@@ -270,13 +270,12 @@ impl UserDict {
         }
     }
 
-    /// Shared read-modify-write primitive behind both `record_selection`
-    /// (D-190: stamp the next sequence number) and `record_registration` (D-182:
-    /// move to the head), so that
-    /// every write to the user dictionary goes through exactly one CAS
-    /// discipline and exactly one pair of index-update hooks (RESEARCH
-    /// Pitfall 1/4: an index hook duplicated per write-path is exactly the
-    /// kind of place a future write-path could silently miss it).
+    /// Read-modify-write primitive under `record_selection`, the single write
+    /// path of both learning and word registration (D-194: stamp the next
+    /// sequence number, D-190), so that every write to the user dictionary goes
+    /// through exactly one CAS discipline and exactly one pair of index-update
+    /// hooks (RESEARCH Pitfall 1/4: an index hook duplicated per write-path is
+    /// exactly the kind of place a future write-path could silently miss it).
     ///
     /// The read-modify-write is confined to a single `sled::Tree::fetch_and_update`
     /// call (a compare-and-swap), so `apply`'s effect is not lost when several
@@ -356,13 +355,13 @@ impl UserDict {
         // that this is one-shot post-processing unrelated to the number of CAS
         // retries. Do not drop either hook - the romaji index of D-73 or the
         // SymSpell index of D-95 (as the warning in the code says).
-        // D-73/D-95 used to have no observable effect through `record_selection`
-        // alone (every user dictionary key also existed in the master
-        // dictionary, since `learn_pair` only becomes `Some` for a candidate
-        // that already came from some dictionary). Phase 10's word registration
-        // (D-182, `record_registration`) is what first creates a reading that
-        // exists only in the user dictionary, and this shared hook is what
-        // makes that reading reachable through fuzzy search (REG-08).
+        // D-73/D-95 used to have no observable effect through learning alone
+        // (every user dictionary key also existed in the master dictionary,
+        // since `learn_pair` only becomes `Some` for a candidate that already
+        // came from some dictionary). Word registration (D-194:
+        // `finish_registration` -> `record_selection`) is what first creates a
+        // reading that exists only in the user dictionary, and this hook is
+        // what makes that reading reachable through fuzzy search (REG-08).
         if let Ok(mut idx) = self.roman_index.write() {
             idx.insert(reading);
         }
@@ -429,7 +428,9 @@ impl Dictionary for UserDict {
     /// after a conflict does not consume another number; the closure itself only
     /// takes `max(old, seq)`. Implemented as a single `update_entries_atomically`
     /// call; see that method's documentation for the CAS discipline (atomicity,
-    /// error handling, the index hooks) shared with `record_registration`.
+    /// error handling, the index hooks). Word registration is recorded here
+    /// too (D-194): the registered word is the most recently selected word of
+    /// its reading, so it heads the reading and is never duplicated (REG-06).
     fn record_selection(&self, reading: &str, word: &str) -> Result<(), DictError> {
         let seq = self.next_seq();
         self.update_entries_atomically(reading, |entries| {
@@ -443,33 +444,6 @@ impl Dictionary for UserDict {
             }
             if !found {
                 entries.push(DictEntry::new(word).with_last_selected(seq));
-            }
-        })
-    }
-
-    /// Moves a registered word to the head of its reading (D-182, Phase 10)
-    ///
-    /// The new frequency is the maximum frequency among `reading`'s existing
-    /// entries, plus one - for both a brand new word and a re-registration of
-    /// the same (reading, word) pair (REG-06: the existing entry's frequency
-    /// is replaced, not duplicated, so re-registering never creates a second
-    /// entry for the same pair). Implemented as a single
-    /// `update_entries_atomically` call; see that method's documentation for
-    /// the CAS discipline shared with `record_selection`.
-    fn record_registration(&self, reading: &str, word: &str) -> Result<(), DictError> {
-        self.update_entries_atomically(reading, |entries| {
-            let max_frequency = entries.iter().map(|e| e.last_selected).max().unwrap_or(0);
-            let new_frequency = max_frequency.saturating_add(1);
-            let mut found = false;
-            for entry in entries.iter_mut() {
-                if entry.word == word {
-                    entry.last_selected = new_frequency;
-                    found = true;
-                    break;
-                }
-            }
-            if !found {
-                entries.push(DictEntry::new(word).with_last_selected(new_frequency));
             }
         })
     }
@@ -1042,154 +1016,6 @@ mod tests {
             symspell_bucket.contains(&"りなっくす".to_string()),
             "りなっくす should be in symspell_bucket right after record_selection: {:?}",
             symspell_bucket
-        );
-    }
-
-    // === D-182: record_registration (Phase 10, word registration) ===
-
-    #[test]
-    fn record_registration_sets_the_frequency_one_above_the_readings_maximum() {
-        let (dict, _tmp) = create_test_dict();
-
-        for _ in 0..3 {
-            dict.record_selection("せっか", "赤化")
-                .expect("failed to record the selection");
-        }
-        dict.record_registration("せっか", "石火")
-            .expect("failed to record the registration");
-
-        let entries = dict.lookup("せっか").expect("lookup failed");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].last_selected, 4);
-        assert_eq!(entries[1].word, "赤化");
-        assert_eq!(entries[1].last_selected, 3);
-    }
-
-    #[test]
-    fn record_registration_starts_a_new_reading_at_one() {
-        let (dict, _tmp) = create_test_dict();
-
-        dict.record_registration("せっか", "石火")
-            .expect("failed to record the registration");
-
-        let entries = dict.lookup("せっか").expect("lookup failed");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].last_selected, 1);
-    }
-
-    #[test]
-    fn record_registration_dedup_keeps_a_single_entry_for_the_same_pair() {
-        let (dict, _tmp) = create_test_dict();
-
-        dict.record_registration("せっか", "石火")
-            .expect("the first registration failed");
-        dict.record_registration("せっか", "石火")
-            .expect("the second (re-)registration failed");
-
-        let entries = dict.lookup("せっか").expect("lookup failed");
-        assert_eq!(
-            entries.len(),
-            1,
-            "re-registering the same (reading, word) pair must not duplicate it: {:?}",
-            entries
-        );
-        assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].last_selected, 2);
-
-        for _ in 0..5 {
-            dict.record_selection("せっか", "赤化")
-                .expect("failed to record the selection");
-        }
-        dict.record_registration("せっか", "石火")
-            .expect("the third registration failed");
-
-        let entries = dict.lookup("せっか").expect("lookup failed");
-        assert_eq!(entries.len(), 2);
-        assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].last_selected, 6);
-        assert_eq!(entries[1].word, "赤化");
-        assert_eq!(entries[1].last_selected, 5);
-    }
-
-    #[test]
-    fn record_registration_adds_the_reading_to_the_roman_and_symspell_indexes() {
-        let (dict, _tmp) = create_test_dict();
-
-        dict.record_registration("りなっくす", "Linux")
-            .expect("failed to record the registration");
-
-        let roman_bucket = dict.roman_bucket("rin").expect("roman_bucket failed");
-        assert!(
-            roman_bucket.iter().any(|rk| rk.reading == "りなっくす"),
-            "りなっくす should be in roman_bucket right after record_registration: {:?}",
-            roman_bucket
-        );
-
-        // Deleting one character from "りなっくす" gives "りなくす" (「っ」 removed).
-        let symspell_bucket = dict
-            .symspell_bucket("りなくす")
-            .expect("symspell_bucket failed");
-        assert!(
-            symspell_bucket.contains(&"りなっくす".to_string()),
-            "りなっくす should be in symspell_bucket right after record_registration: {:?}",
-            symspell_bucket
-        );
-    }
-
-    #[test]
-    fn record_registration_lands_on_exactly_800_with_8_threads_of_100() {
-        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
-        let dict_path = tmp.path().join("test_user_dict");
-        let dict = std::sync::Arc::new(
-            UserDict::open(&dict_path).expect("failed to open the user dictionary"),
-        );
-
-        let mut handles = Vec::new();
-        for _ in 0..8 {
-            let dict = std::sync::Arc::clone(&dict);
-            handles.push(std::thread::spawn(move || {
-                for _ in 0..100 {
-                    dict.record_registration("せっか", "石火")
-                        .expect("failed to record the registration");
-                }
-            }));
-        }
-        for handle in handles {
-            handle.join().expect("failed to join a thread");
-        }
-
-        let entries = dict.lookup("せっか").expect("lookup failed");
-        assert_eq!(entries.len(), 1);
-        assert_eq!(
-            entries[0].last_selected, 800,
-            "8 threads x 100 re-registrations of the same pair should land on \
-             exactly 800 (every write is \"max + 1\" including itself, so with \
-             no lost updates the count still lands on the thread x iteration total)"
-        );
-    }
-
-    #[test]
-    fn record_registration_returns_an_error_without_deleting_a_key_holding_a_broken_value() {
-        let (dict, _tmp) = create_test_dict();
-
-        dict.db
-            .insert("せっか".as_bytes(), b"not json".to_vec())
-            .expect("the direct write failed");
-
-        let result = dict.record_registration("せっか", "石火");
-        assert!(result.is_err(), "a broken value should yield Err");
-
-        let raw = dict
-            .db
-            .get("せっか".as_bytes())
-            .expect("failed to access the db")
-            .expect("the key was deleted");
-        assert_eq!(
-            raw.as_ref(),
-            b"not json",
-            "a key holding a broken value should keep its original bytes rather than be deleted"
         );
     }
 

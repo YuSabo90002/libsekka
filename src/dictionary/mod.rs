@@ -169,27 +169,15 @@ pub trait Dictionary {
     /// Records the candidate the user selected as the most recently selected
     /// one (D-36, D-190)
     ///
+    /// Word registration is recorded through this same method (D-194, Phase 12):
+    /// there is no separate registration write, a registered word is simply the
+    /// most recently selected word of its reading.
+    ///
     /// The default implementation returns `DictError::ReadOnlyViolation` for
     /// read-only dictionaries. Only writable dictionaries (`UserDict`) override
     /// it. The receiver is `&self` so that sled's interior mutability lets us
     /// call it while the dictionary is shared through `Vec<Arc<dyn Dictionary>>`.
     fn record_selection(&self, _reading: &str, _word: &str) -> Result<(), DictError> {
-        Err(DictError::ReadOnlyViolation)
-    }
-
-    /// Moves a registered word to the head of its reading (D-182, Phase 10)
-    ///
-    /// Registration moves the word to the head of its reading: the new
-    /// frequency is the maximum frequency among that reading's
-    /// user-dictionary entries, plus one - for a brand new word and for
-    /// re-registering the same (reading, word) pair alike, never duplicating
-    /// (REG-06). A separate operation from `record_selection`'s plain +1 (a
-    /// future switch from frequency-count learning to MRU, todo
-    /// 2026-09-28-switch-learning-to-mru, is expected to replace ordinary
-    /// learning with this same operation). The default implementation
-    /// refuses read-only dictionaries (the master dictionary); only writable
-    /// dictionaries (`UserDict`) override it.
-    fn record_registration(&self, _reading: &str, _word: &str) -> Result<(), DictError> {
         Err(DictError::ReadOnlyViolation)
     }
 
