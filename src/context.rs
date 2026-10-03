@@ -5762,4 +5762,241 @@ mod tests {
         ctx.process_key('\0', true);
         assert_eq!(ctx.get_preedit(), "赤化");
     }
+
+    /// Feeds `Sekka`-style romaji, stages the first candidate with Ctrl-J, checks that the
+    /// preedit shows `expected`, then commits it as it is (no reselection) and drains the
+    /// output. This is the "first candidate confirmed as it stands" operation (D-192).
+    fn commit_first_candidate_as_it_stands(ctx: &mut SekkaContext, input: &str, expected: &str) {
+        for ch in input.chars() {
+            ctx.process_key(ch, false);
+        }
+        assert!(
+            ctx.process_key('\0', true),
+            "Ctrl-J should place the first candidate in the preedit"
+        );
+        assert_eq!(
+            ctx.get_preedit(),
+            expected,
+            "the first candidate of {input:?} should be {expected:?}"
+        );
+        assert!(
+            ctx.flush_last_commit(),
+            "the staged first candidate should be committed (and recorded)"
+        );
+        assert_eq!(ctx.poll_output(), Some(expected.to_string()));
+    }
+
+    /// Enters reselection for `input`, moves to the next candidate, checks that it is
+    /// `expected` and confirms it, then flushes the recording (D-34).
+    fn reselect_next_and_confirm(ctx: &mut SekkaContext, input: &str, expected: &str) {
+        commit_then_reselect(ctx, input);
+        ctx.next_candidate();
+        assert_eq!(
+            ctx.get_candidates()[ctx.get_candidate_index() as usize].display,
+            expected,
+            "the next candidate of {input:?} should be {expected:?}"
+        );
+        ctx.confirm();
+        assert!(ctx.poll_output().is_none());
+        assert!(ctx.flush_last_commit());
+        ctx.poll_output();
+    }
+
+    /// The user dictionary's `last_selected` of `word` under `reading` (panics if absent).
+    fn last_selected_of(user_dict: &UserDict, reading: &str, word: &str) -> u64 {
+        user_dict
+            .lookup(reading)
+            .expect("user dictionary lookup failed")
+            .into_iter()
+            .find(|e| e.word == word)
+            .unwrap_or_else(|| panic!("{word} is not recorded under {reading}"))
+            .last_selected
+    }
+
+    #[test]
+    fn mru_the_last_selected_word_leads_even_after_another_was_chosen_more_often() {
+        // LEARN-01 / D-190 / D-192: the word chosen last leads, not the most frequent
+        // one. 赤化 is dictionary-first and chosen five times as it stands; one choice of
+        // 石火 then wins (5 against 1 would keep 赤化 under a count), and one choice of
+        // 赤化 brings it back to the front (the consequence of A1).
+        let mut master = MockDictionary::new();
+        master.add_entry("せっか", "赤化");
+        master.add_entry("せっか", "石火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        for _ in 0..5 {
+            commit_first_candidate_as_it_stands(&mut ctx, "Sekka", "赤化");
+        }
+
+        reselect_next_and_confirm(&mut ctx, "Sekka", "石火");
+        commit_first_candidate_as_it_stands(&mut ctx, "Sekka", "石火");
+
+        reselect_next_and_confirm(&mut ctx, "Sekka", "赤化");
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(
+            ctx.get_preedit(),
+            "赤化",
+            "one more choice of 赤化 puts it back at the front"
+        );
+
+        let words: Vec<String> = user_dict
+            .lookup("せっか")
+            .expect("user dictionary lookup failed")
+            .into_iter()
+            .map(|e| e.word)
+            .collect();
+        assert_eq!(
+            words,
+            vec!["赤化".to_string(), "石火".to_string()],
+            "the user dictionary lists the words in the order they were last selected"
+        );
+    }
+
+    #[test]
+    fn mru_first_candidate_commit_is_recorded_as_the_latest_selection() {
+        // LEARN-03 / D-192: confirming the dictionary-first, not yet learned word as it
+        // stands records it with a sequence number; a later choice outranks it; and the
+        // word that has become first through learning gets a fresh number when it is
+        // confirmed as it stands again.
+        let mut master = MockDictionary::new();
+        master.add_entry("せっか", "赤化");
+        master.add_entry("せっか", "石火");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        // (1) The unlearned, dictionary-first word confirmed as it stands is recorded.
+        commit_first_candidate_as_it_stands(&mut ctx, "Sekka", "赤化");
+        let recorded = user_dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(recorded.len(), 1, "only 赤化 is recorded: {recorded:?}");
+        assert_eq!(recorded[0].word, "赤化");
+        let a = recorded[0].last_selected;
+        assert!(
+            a >= 1,
+            "a recorded selection has a sequence number >= 1: {a}"
+        );
+
+        // (2) Choosing 石火 afterwards gives it a larger number.
+        reselect_next_and_confirm(&mut ctx, "Sekka", "石火");
+        let b = last_selected_of(&user_dict, "せっか", "石火");
+        assert!(b > a, "石火 chosen after 赤化 outranks it: a={a} b={b}");
+
+        // (3) 石火 is now first; confirming it as it stands again takes a newer number.
+        commit_first_candidate_as_it_stands(&mut ctx, "Sekka", "石火");
+        let c = last_selected_of(&user_dict, "せっか", "石火");
+        assert!(
+            c > b,
+            "the learned first candidate confirmed as it stands is recorded again: b={b} c={c}"
+        );
+
+        // (4) Choosing 赤化 again brings it to the front; the order follows the choices.
+        reselect_next_and_confirm(&mut ctx, "Sekka", "赤化");
+        let d = last_selected_of(&user_dict, "せっか", "赤化");
+        assert!(
+            d > c,
+            "赤化 chosen last holds the largest number: c={c} d={d}"
+        );
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "赤化");
+        let words: Vec<String> = user_dict
+            .lookup("せっか")
+            .expect("lookup failed")
+            .into_iter()
+            .map(|e| e.word)
+            .collect();
+        assert_eq!(words, vec!["赤化".to_string(), "石火".to_string()]);
+    }
+
+    #[test]
+    fn mru_fuzzy_stage_orders_other_readings_by_last_selection() {
+        // LEARN-02 / D-191 / D-145: the exact match (核 under かく) is always first, even
+        // though it was never learned. In the fuzzy stage, words that came from other
+        // readings (角 from かど, 鍵 from かぎ) follow the order they were last selected,
+        // not how many times they were selected (鍵 twice, 角 once).
+        //
+        // `MockDictionary` has no SymSpell index of its own, so 角 and 鍵 reach the fuzzy
+        // stage only through the index `record_selection` builds in the user dictionary.
+        // That is why they are learned first; their tier is asserted as the evidence that
+        // they really come from the fuzzy stage.
+        let mut master = MockDictionary::new();
+        master.add_entry("かく", "核");
+        master.add_entry("かど", "角");
+        master.add_entry("かぎ", "鍵");
+
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(master), user_dict.clone()]);
+
+        // 鍵 twice, 角 once, in this order: 角 is the last one selected.
+        commit_first_candidate_as_it_stands(&mut ctx, "Kagi", "鍵");
+        commit_first_candidate_as_it_stands(&mut ctx, "Kagi", "鍵");
+        commit_first_candidate_as_it_stands(&mut ctx, "Kado", "角");
+
+        let committed = commit_then_reselect(&mut ctx, "Kaku");
+        assert_eq!(
+            committed, "核",
+            "the never-learned exact match leads the fuzzy-stage learned words"
+        );
+        let candidates = ctx.get_candidates();
+        let displays: Vec<&str> = candidates.iter().map(|c| c.display.as_str()).collect();
+        assert_eq!(displays[0], "核", "核 stays first: {displays:?}");
+        let position = |word: &str| -> usize {
+            displays.iter().position(|d| *d == word).unwrap_or_else(|| {
+                panic!("{word} is missing from the Kaku candidates: {displays:?}")
+            })
+        };
+        for word in ["角", "鍵"] {
+            let tier = candidates[position(word)].tier;
+            assert!(
+                tier >= 1,
+                "{word} must come from the fuzzy stage (tier >= 1), got {tier}: {displays:?}"
+            );
+        }
+        assert!(
+            position("角") < position("鍵"),
+            "角 (selected last, once) comes before 鍵 (selected twice): {displays:?}"
+        );
+
+        // Discard the read-only Kaku conversion, then select 鍵 once more: it moves ahead.
+        ctx.reset();
+        commit_first_candidate_as_it_stands(&mut ctx, "Kagi", "鍵");
+        let committed = commit_then_reselect(&mut ctx, "Kaku");
+        assert_eq!(committed, "核");
+        let displays: Vec<&str> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.as_str())
+            .collect();
+        let pos = |word: &str| displays.iter().position(|d| *d == word).unwrap();
+        assert_eq!(displays[0], "核", "核 stays first: {displays:?}");
+        assert!(
+            pos("鍵") < pos("角"),
+            "鍵 selected last now comes before 角: {displays:?}"
+        );
+    }
 }
