@@ -335,8 +335,10 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
 
     // === WA row ===
     rule!("wa", "わ");
-    rule!("wi", "ゐ");
-    rule!("we", "ゑ");
+    // Changed in v1.4 from the old wi/we kana (D-206): wi and we now give the
+    // usual u + small i/e. The old kana are typed with yi, wyi and wye.
+    rule!("wi", "うぃ");
+    rule!("we", "うぇ");
     rule!("wo", "を");
 
     // === N ===
@@ -445,6 +447,48 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("pyu", "ぴゅ");
     rule!("pyo", "ぴょ");
 
+    // === Youon: -ye (D-205, ROMA-01) ===
+    rule!("che", "ちぇ");
+    rule!("tye", "ちぇ");
+    rule!("she", "しぇ");
+    rule!("sye", "しぇ");
+    rule!("je", "じぇ");
+    rule!("jye", "じぇ");
+    rule!("zye", "じぇ");
+    rule!("dye", "ぢぇ");
+    rule!("kye", "きぇ");
+    rule!("gye", "ぎぇ");
+    rule!("nye", "にぇ");
+    rule!("hye", "ひぇ");
+    rule!("bye", "びぇ");
+    rule!("pye", "ぴぇ");
+    rule!("mye", "みぇ");
+    rule!("rye", "りぇ");
+
+    // === Youon: -yi (D-205, ROMA-04) ===
+    rule!("kyi", "きぃ");
+    rule!("gyi", "ぎぃ");
+    rule!("syi", "しぃ");
+    rule!("zyi", "じぃ");
+    rule!("jyi", "じぃ");
+    rule!("tyi", "ちぃ");
+    rule!("dyi", "ぢぃ");
+    rule!("nyi", "にぃ");
+    rule!("hyi", "ひぃ");
+    rule!("byi", "びぃ");
+    rule!("pyi", "ぴぃ");
+    rule!("myi", "みぃ");
+    rule!("ryi", "りぃ");
+
+    // === W row extensions (D-205, ROMA-03) ===
+    // yi, wyi and wye are the new spellings of the old wi/we kana (D-206).
+    rule!("whi", "うぃ");
+    rule!("whe", "うぇ");
+    rule!("who", "うぉ");
+    rule!("yi", "ゐ");
+    rule!("wyi", "ゐ");
+    rule!("wye", "ゑ");
+
     // === V row: U+3046 U+309B, the spacing voiced sound mark after u (D-207) ===
     // Never U+3094 or U+3099: the master dictionary headings use U+3046 U+309B.
     // The outputs are written as escapes because the three forms look alike.
@@ -473,6 +517,10 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("xtsu", "っ");
     rule!("ltsu", "っ");
     rule!("xwa", "ゎ");
+    rule!("lya", "ゃ");
+    rule!("lyu", "ゅ");
+    rule!("lyo", "ょ");
+    rule!("lwa", "ゎ");
 
     // === Special combinations ===
     rule!("fa", "ふぁ");
@@ -486,6 +534,10 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
 
     rule!("thi", "てぃ");
     rule!("dhi", "でぃ");
+    // thu and dhu follow ddskk, libskk and Mozc rather than upstream's
+    // te/de + small u (R1 (b)).
+    rule!("thu", "てゅ");
+    rule!("dhu", "でゅ");
 
     // === Symbols ===
     rule!("-", "ー");
