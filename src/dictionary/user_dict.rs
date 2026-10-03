@@ -974,6 +974,77 @@ mod tests {
         );
     }
 
+    // === D-194: word registration goes through record_selection ===
+
+    /// REG-06 / D-194: recording the same (reading, word) pair again never
+    /// duplicates it, and the most recent record is always the head.
+    #[test]
+    fn record_selection_never_duplicates_a_reading_word_pair() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.record_selection("せっか", "石火")
+            .expect("the first record failed");
+        dict.record_selection("せっか", "石火")
+            .expect("the second record failed");
+
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(
+            entries.len(),
+            1,
+            "recording the same (reading, word) pair twice must not duplicate it: {:?}",
+            entries
+        );
+        assert_eq!(entries[0].word, "石火");
+
+        for _ in 0..5 {
+            dict.record_selection("せっか", "赤化")
+                .expect("failed to record the selection");
+        }
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 2, "{:?}", entries);
+        assert_eq!(entries[0].word, "赤化");
+
+        dict.record_selection("せっか", "石火")
+            .expect("the third record failed");
+        let entries = dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries.len(), 2, "{:?}", entries);
+        assert_eq!(entries[0].word, "石火");
+        assert_eq!(entries[1].word, "赤化");
+        assert!(
+            entries[0].last_selected > entries[1].last_selected,
+            "the latest record must carry the highest number: {:?}",
+            entries
+        );
+    }
+
+    /// REG-08 / D-194: a reading that exists only in the user dictionary (a
+    /// registered word, not a learned master-dictionary candidate) reaches the
+    /// roman and SymSpell indexes through `record_selection`'s index hooks.
+    #[test]
+    fn record_selection_indexes_a_reading_that_exists_only_in_the_user_dictionary() {
+        let (dict, _tmp) = create_test_dict();
+
+        dict.record_selection("りなっくす", "Linux")
+            .expect("failed to record the selection");
+
+        let roman_bucket = dict.roman_bucket("rin").expect("roman_bucket failed");
+        assert!(
+            roman_bucket.iter().any(|rk| rk.reading == "りなっくす"),
+            "りなっくす should be in roman_bucket right after record_selection: {:?}",
+            roman_bucket
+        );
+
+        // Deleting one character from "りなっくす" gives "りなくす" (「っ」 removed).
+        let symspell_bucket = dict
+            .symspell_bucket("りなくす")
+            .expect("symspell_bucket failed");
+        assert!(
+            symspell_bucket.contains(&"りなっくす".to_string()),
+            "りなっくす should be in symspell_bucket right after record_selection: {:?}",
+            symspell_bucket
+        );
+    }
+
     // === D-182: record_registration (Phase 10, word registration) ===
 
     #[test]

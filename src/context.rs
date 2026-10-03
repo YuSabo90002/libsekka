@@ -4949,9 +4949,10 @@ mod tests {
         ctx.poll_output()
     }
 
-    /// REG-07 / D-182: a word registered under a reading takes over the head
+    /// REG-07 / D-194: a word registered under a reading takes over the head
     /// of that reading's user-dictionary entries even when another word was
-    /// already learned there (frequency = the existing maximum + 1).
+    /// already learned there (the registration is recorded last, so it carries
+    /// the highest sequence number).
     #[test]
     fn finish_registration_puts_the_word_first_even_over_a_learned_word() {
         let mut dict = MockDictionary::new();
@@ -4983,9 +4984,12 @@ mod tests {
         let entries = user_dict.lookup("せっか").expect("lookup failed");
         assert_eq!(entries.len(), 2, "{:?}", entries);
         assert_eq!(entries[0].word, "石火");
-        assert_eq!(entries[0].last_selected, 3);
         assert_eq!(entries[1].word, "赤化");
-        assert_eq!(entries[1].last_selected, 2);
+        assert!(
+            entries[0].last_selected > entries[1].last_selected,
+            "the registration is the last record, so 石火 must carry a higher number than 赤化: {:?}",
+            entries
+        );
 
         for ch in "Sekka".chars() {
             ctx.process_key(ch, false);
@@ -5072,11 +5076,26 @@ mod tests {
 
         let entries = user_dict.lookup("せっか").expect("lookup failed");
         assert_eq!(
-            entries,
-            vec![DictEntry::new("石火").with_last_selected(1)],
+            entries.len(),
+            1,
             "赤化 (the candidate staged before Ctrl-R) must not appear: {:?}",
             entries
         );
+        assert_eq!(entries[0].word, "石火");
+        // The inner commits (石 and 火) take their numbers first, the
+        // registration is recorded after them (Pitfall 2), so it is higher
+        // than both.
+        for inner_reading in ["せき", "か"] {
+            for inner in user_dict.lookup(inner_reading).expect("lookup failed") {
+                assert!(
+                    entries[0].last_selected > inner.last_selected,
+                    "the registration of 石火 must be numbered after the inner commit {:?} of {}: {:?}",
+                    inner,
+                    inner_reading,
+                    entries
+                );
+            }
+        }
     }
 
     /// REG-08: a word registered under a reading is found through the same
@@ -5383,7 +5402,12 @@ mod tests {
             sekka_entries
         );
         assert_eq!(sekka_entries[0].word, "石火");
-        assert_eq!(sekka_entries[0].last_selected, 1);
+        assert!(
+            sekka_entries[0].last_selected > seki_entries[0].last_selected,
+            "the outer registration of 石火 is recorded after the inner one of 石: {:?} vs {:?}",
+            sekka_entries,
+            seki_entries
+        );
     }
 
     /// D-171/D-179: cancelling a nested registration step drops only that
@@ -5532,8 +5556,8 @@ mod tests {
     /// unrelated to and unaffected by `finalize_for_reset`); what
     /// `finalize_for_reset` itself must guarantee is that the reading being
     /// registered (せっか) never gets an entry of its own, since
-    /// `finish_registration` (and its D-182 `record_registration`) is never
-    /// reached.
+    /// `finish_registration` (and its D-194 `record_selection` of the
+    /// registered pair) is never reached.
     #[test]
     fn finalize_for_reset_commits_only_the_outermost_reading() {
         let mut dict = MockDictionary::new();
@@ -5587,7 +5611,7 @@ mod tests {
                 .expect("lookup failed")
                 .is_empty(),
             "the reading being registered must never get an entry - finish_registration \
-             (and its D-182 write) is never reached"
+             (and its D-194 `record_selection` of the registered pair) is never reached"
         );
     }
 

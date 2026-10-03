@@ -318,10 +318,13 @@ mod tests {
         assert_eq!(json, r#"{"word":"x","annotation":null,"last_selected":5}"#);
     }
 
-    /// D-182: the master dictionary (read-only, immutable format) refuses
-    /// `record_registration` through the trait's default implementation.
+    /// Pitfall 7: the master dictionary (read-only, immutable format) refuses
+    /// `record_selection` through the trait's default implementation. This is
+    /// the only test pinning the trait's read-only default - word registration
+    /// writes through `record_selection` too (D-194), so there is no separate
+    /// registration method left to refuse.
     #[test]
-    fn read_only_dictionaries_refuse_record_registration() {
+    fn read_only_dictionaries_refuse_record_selection() {
         use crate::dictionary::immutable_dict::ImmutableFileDict;
         use std::collections::BTreeMap;
 
@@ -331,10 +334,10 @@ mod tests {
         dict_format::write_dict(&path, &entries).expect("write_dict failed");
 
         let dict = ImmutableFileDict::open(&path).expect("failed to open the dictionary");
-        let result = dict.record_registration("せっか", "石火");
+        let result = dict.record_selection("せっか", "石火");
         assert!(
             matches!(result, Err(DictError::ReadOnlyViolation)),
-            "a read-only dictionary should refuse record_registration: {:?}",
+            "a read-only dictionary should refuse record_selection: {:?}",
             result
         );
     }
