@@ -411,4 +411,93 @@ mod tests {
         assert_eq!(stem, "kanji");
         assert_eq!(okuri, "");
     }
+
+    /// Feeds a romaji string through the converter one character at a time and
+    /// returns the kana (what `romaji_to_kana` does for a stem or an okurigana).
+    fn kana_of(romaji: &str) -> String {
+        let mut converter = crate::romaji::RomajiConverter::new();
+        let mut kana = String::new();
+        for ch in romaji.chars() {
+            kana.extend(converter.feed(ch));
+        }
+        kana.extend(converter.flush());
+        kana
+    }
+
+    #[test]
+    fn newly_spellable_lowercase_words_move_from_symbol_to_hiragana_convertible() {
+        // D-212: the v1.3 table classified these as Symbol; the new rules make them
+        // spellable to the end, and D-212 accepts that Ctrl-J now offers hiragana
+        // first while the half-width alphabet stays selectable with Ctrl-L.
+        for input in [
+            "che", "tye", "she", "je", "va", "whi", "thu", "dyi", "java", "live", "video",
+        ] {
+            assert_eq!(
+                classify_input_shape(input),
+                InputShape::HiraganaConvertible,
+                "input={:?}",
+                input
+            );
+        }
+        // These still leave a letter that cannot be spelled at the end (or have no
+        // rule), so they stay Symbol.
+        for input in ["vim", "vivid", "web", "cat", "the", "type"] {
+            assert_eq!(
+                classify_input_shape(input),
+                InputShape::Symbol,
+                "input={:?}",
+                input
+            );
+        }
+        // wine was already convertible (wi was a rule before); only its reading
+        // changes, from ゐね to うぃね.
+        assert_eq!(
+            classify_input_shape("wine"),
+            InputShape::HiraganaConvertible
+        );
+    }
+
+    #[test]
+    fn okurigana_boundary_splits_a_new_rule_into_stem_and_okuri() {
+        // Claude's Discretion (three forms): lowercase, leading capital, and a
+        // capital inside the word (okurigana). The rule never crosses the stem /
+        // okurigana boundary because each part is converted on its own.
+        for (input, stem_kana, okuri_kana) in [
+            ("kaTye", "か", "ちぇ"),
+            ("kaVa", "か", "\u{3046}\u{309B}\u{3041}"),
+        ] {
+            assert_eq!(
+                classify_input_shape(input),
+                InputShape::CaseBased,
+                "input={:?}",
+                input
+            );
+            let req = analyze_input(input);
+            assert_eq!(
+                req.mode,
+                ConversionMode::KanjiWithOkuri,
+                "input={:?}",
+                input
+            );
+            let (stem, okuri) = split_okuri(input, req.okuri_position);
+            assert_eq!(stem, "ka", "input={:?}", input);
+            assert_eq!(okuri, input[2..].to_ascii_lowercase(), "input={:?}", input);
+            assert_eq!(kana_of(&stem), stem_kana, "input={:?}", input);
+            assert_eq!(kana_of(&okuri), okuri_kana, "input={:?}", input);
+        }
+        // A leading capital alone is KanjiConvert and the whole word is the stem.
+        for (input, expected) in [("Tye", "ちぇ"), ("Va", "\u{3046}\u{309B}\u{3041}")] {
+            assert_eq!(
+                classify_input_shape(input),
+                InputShape::CaseBased,
+                "input={:?}",
+                input
+            );
+            let req = analyze_input(input);
+            assert_eq!(req.mode, ConversionMode::KanjiConvert, "input={:?}", input);
+            let (stem, okuri) = split_okuri(input, req.okuri_position);
+            assert_eq!(okuri, "", "input={:?}", input);
+            assert_eq!(kana_of(&stem), expected, "input={:?}", input);
+        }
+    }
 }
