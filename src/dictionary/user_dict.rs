@@ -48,6 +48,9 @@ impl StoredEntry {
     }
 }
 
+/// The rows `plan_migration` rewrites, and the highest sequence number in use afterwards
+type MigrationPlan = (Vec<(String, Vec<DictEntry>)>, u64);
+
 /// Plans the one-time migration of v1.3 elements (D-195)
 ///
 /// `rows` are the readings that hold at least one legacy element, with all their
@@ -64,10 +67,7 @@ impl StoredEntry {
 /// that order. Two elements of different readings with the same count have no
 /// relative order to preserve (v1.3 never compared them); the reading's bytes
 /// decide, which is arbitrary but deterministic.
-fn plan_migration(
-    rows: &[(String, Vec<StoredEntry>)],
-    base: u64,
-) -> Option<(Vec<(String, Vec<DictEntry>)>, u64)> {
+fn plan_migration(rows: &[(String, Vec<StoredEntry>)], base: u64) -> Option<MigrationPlan> {
     let mut legacy: Vec<(u32, &str, usize, usize)> = Vec::new();
     for (row, (reading, entries)) in rows.iter().enumerate() {
         for (position, entry) in entries.iter().enumerate() {
@@ -253,13 +253,21 @@ impl UserDict {
     /// closure never consumes another number. Numbers are unique and increase
     /// across threads; the first number of an empty dictionary is 1.
     fn next_seq(&self) -> u64 {
-        let previous = self
-            .last_seq
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| {
-                Some(v.saturating_add(1))
-            })
-            .expect("the closure always returns Some");
-        previous.saturating_add(1)
+        // A compare-exchange loop rather than `fetch_update`: that name is deprecated
+        // on current stable, and its replacement `try_update` is newer than the MSRV.
+        let mut current = self.last_seq.load(Ordering::SeqCst);
+        loop {
+            let next = current.saturating_add(1);
+            match self.last_seq.compare_exchange_weak(
+                current,
+                next,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return next,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     /// Flushes the sled database to disk
