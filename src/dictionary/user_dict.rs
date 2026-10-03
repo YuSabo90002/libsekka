@@ -1204,4 +1204,245 @@ mod tests {
             "the sequence continues from the migrated maximum"
         );
     }
+
+    // === D-195: boundary tests of the one-time migration (integration) ===
+
+    /// Writes v1.3-shaped values straight into a new dictionary without migrating,
+    /// then closes it (sled holds an exclusive lock, so the handle must be dropped
+    /// before the next open).
+    fn write_v13_dictionary(path: &Path, rows: &[(&str, &str)]) {
+        let old = UserDict::open_with(path, false).expect("failed to open");
+        for (reading, json) in rows {
+            old.db
+                .insert(reading.as_bytes(), json.as_bytes())
+                .expect("the direct write failed");
+        }
+        old.save().expect("flush failed");
+    }
+
+    /// Every raw `(key, value)` pair of the dictionary at `path`, in key order.
+    fn raw_snapshot(path: &Path) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let db = sled::open(path).expect("failed to open the raw sled database");
+        db.iter()
+            .map(|pair| {
+                let (key, value) = pair.expect("failed to read a raw pair");
+                (key.to_vec(), value.to_vec())
+            })
+            .collect()
+    }
+
+    /// The raw value stored under `reading` in a snapshot.
+    fn raw_value<'a>(snapshot: &'a [(Vec<u8>, Vec<u8>)], reading: &str) -> &'a [u8] {
+        snapshot
+            .iter()
+            .find(|(key, _)| key == reading.as_bytes())
+            .map(|(_, value)| value.as_slice())
+            .unwrap_or_else(|| panic!("{reading} is not in the snapshot"))
+    }
+
+    const V13_KANJI: &str = r#"[{"word":"漢字","annotation":null,"frequency":1},{"word":"幹事","annotation":null,"frequency":5}]"#;
+    const V13_KAN_J: &str = r#"[{"word":"感","annotation":null,"frequency":2}]"#;
+
+    #[test]
+    fn opening_a_migrated_dictionary_again_changes_nothing() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        write_v13_dictionary(&path, &[("かんじ", V13_KANJI), ("かんj", V13_KAN_J)]);
+
+        // First open migrates.
+        drop(UserDict::open(&path).expect("failed to open (migrating)"));
+        let migrated = raw_snapshot(&path);
+        assert!(
+            !String::from_utf8_lossy(raw_value(&migrated, "かんじ")).contains("frequency"),
+            "the first open must have migrated the dictionary"
+        );
+
+        // Opening it again - twice - writes nothing.
+        drop(UserDict::open(&path).expect("failed to open (second)"));
+        assert_eq!(raw_snapshot(&path), migrated);
+        drop(UserDict::open(&path).expect("failed to open (third)"));
+        assert_eq!(raw_snapshot(&path), migrated);
+    }
+
+    #[test]
+    fn open_writes_nothing_to_a_dictionary_without_legacy_entries() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        {
+            let dict = UserDict::open(&path).expect("failed to open");
+            dict.record_selection("かんじ", "漢字")
+                .expect("record failed");
+            dict.record_selection("かんじ", "幹事")
+                .expect("record failed");
+            dict.record_selection("かんj", "感").expect("record failed");
+            dict.save().expect("flush failed");
+        }
+        let before = raw_snapshot(&path);
+        assert_eq!(before.len(), 2, "two readings were recorded");
+
+        drop(UserDict::open(&path).expect("failed to open"));
+        assert_eq!(
+            raw_snapshot(&path),
+            before,
+            "open must not write when no element is legacy"
+        );
+    }
+
+    #[test]
+    fn open_leaves_an_unparseable_value_untouched_while_migrating_the_rest() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        let not_json = "not json";
+        let negative = r#"[{"word":"a","annotation":null,"frequency":-1}]"#;
+        write_v13_dictionary(
+            &path,
+            &[
+                ("こわれ", not_json),
+                ("まいなす", negative),
+                ("かんじ", V13_KANJI),
+            ],
+        );
+        let before = raw_snapshot(&path);
+
+        let dict = UserDict::open(&path).expect("a damaged value must not fail the open");
+        let entries = dict.lookup("かんじ").expect("lookup failed");
+        assert_eq!(entries.len(), 2);
+        assert!(entries.iter().all(|e| e.last_selected >= 1));
+        drop(dict);
+
+        let after = raw_snapshot(&path);
+        assert_eq!(raw_value(&after, "こわれ"), not_json.as_bytes());
+        assert_eq!(raw_value(&after, "まいなす"), negative.as_bytes());
+        assert_eq!(
+            raw_value(&after, "こわれ"),
+            raw_value(&before, "こわれ"),
+            "the unparseable value must be byte-for-byte unchanged"
+        );
+        assert_ne!(
+            raw_value(&after, "かんじ"),
+            raw_value(&before, "かんじ"),
+            "the readable legacy value must have been migrated"
+        );
+        assert!(!String::from_utf8_lossy(raw_value(&after, "かんじ")).contains("frequency"));
+    }
+
+    #[test]
+    fn open_with_migrate_false_never_writes_and_a_later_open_completes_the_migration() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        write_v13_dictionary(&path, &[("かんじ", V13_KANJI), ("かんj", V13_KAN_J)]);
+        let before = raw_snapshot(&path);
+
+        {
+            // The non-migrating entry is the state a crash before the Batch leaves.
+            let dict = UserDict::open_with(&path, false).expect("failed to open");
+            let entries = dict.lookup("かんじ").expect("lookup failed");
+            assert_eq!(entries.len(), 2);
+            assert!(
+                entries.iter().all(|e| e.last_selected == 0),
+                "an unmigrated element reads as number 0: {entries:?}"
+            );
+        }
+        assert_eq!(
+            raw_snapshot(&path),
+            before,
+            "the non-migrating entry must not write"
+        );
+
+        // The next open completes the migration, preserving the v1.3 order.
+        let dict = UserDict::open(&path).expect("failed to open");
+        let entries = dict.lookup("かんじ").expect("lookup failed");
+        let words: Vec<&str> = entries.iter().map(|e| e.word.as_str()).collect();
+        assert_eq!(words, vec!["幹事", "漢字"]);
+        assert_eq!(
+            entries.iter().map(|e| e.last_selected).collect::<Vec<_>>(),
+            vec![3, 1]
+        );
+        assert_eq!(
+            dict.lookup("かんj").expect("lookup failed")[0].last_selected,
+            2
+        );
+        drop(dict);
+        assert!(
+            !String::from_utf8_lossy(raw_value(&raw_snapshot(&path), "かんじ"))
+                .contains("frequency")
+        );
+    }
+
+    #[test]
+    fn open_stacks_legacy_entries_above_the_numbers_already_in_use() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        {
+            let dict = UserDict::open(&path).expect("failed to open");
+            for _ in 0..3 {
+                dict.record_selection("かんじ", "漢字")
+                    .expect("record failed");
+            }
+            dict.save().expect("flush failed");
+        }
+        {
+            // A v1.3 reading appears next to the already-numbered one.
+            let old = UserDict::open_with(&path, false).expect("failed to open");
+            old.db
+                .insert("かんj".as_bytes(), V13_KAN_J.as_bytes())
+                .expect("the direct write failed");
+            old.save().expect("flush failed");
+        }
+
+        let dict = UserDict::open(&path).expect("failed to open");
+        let kan_j = dict.lookup("かんj").expect("lookup failed");
+        assert_eq!(
+            kan_j[0].last_selected, 4,
+            "the legacy element stacks above the highest number in use (3)"
+        );
+        let kanji = dict.lookup("かんじ").expect("lookup failed");
+        assert_eq!(
+            kanji[0].last_selected, 3,
+            "the numbered reading is untouched"
+        );
+
+        dict.record_selection("かんj", "感").expect("record failed");
+        assert_eq!(
+            dict.lookup("かんj").expect("lookup failed")[0].last_selected,
+            5,
+            "the sequence continues above the migrated maximum"
+        );
+    }
+
+    /// Measurement only (SC-006): how long `open` takes with a migration and with
+    /// only the rescan of an already-migrated dictionary. It asserts nothing.
+    /// Run: `cargo test --release -- --ignored --nocapture open_scan`
+    #[test]
+    #[ignore = "records timings for SC-006; not a pass/fail gate"]
+    fn open_scan_time_is_recorded_for_1k_10k_100k_keys() {
+        for n in [1_000usize, 10_000, 100_000] {
+            let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+            let path = tmp.path().join("test_user_dict");
+            {
+                let old = UserDict::open_with(&path, false).expect("failed to open");
+                for i in 0..n {
+                    let value = format!(
+                        r#"[{{"word":"語{i}","annotation":null,"frequency":{}}},{{"word":"別{i}","annotation":null,"frequency":{}}}]"#,
+                        i % 7 + 1,
+                        i % 11 + 1
+                    );
+                    old.db
+                        .insert(format!("よみ{i}").as_bytes(), value.as_bytes())
+                        .expect("the direct write failed");
+                }
+                old.save().expect("flush failed");
+            }
+
+            let started = std::time::Instant::now();
+            drop(UserDict::open(&path).expect("failed to open (migrating)"));
+            let migrate_ms = started.elapsed().as_millis();
+
+            let started = std::time::Instant::now();
+            drop(UserDict::open(&path).expect("failed to open (rescan)"));
+            let rescan_ms = started.elapsed().as_millis();
+
+            println!("open_scan n={n} migrate_ms={migrate_ms} rescan_ms={rescan_ms}");
+        }
+    }
 }
