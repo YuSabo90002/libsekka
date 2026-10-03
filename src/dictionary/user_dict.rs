@@ -146,6 +146,9 @@ pub struct UserDict {
     /// `open`, never persisted on its own (D-190). `next_seq` hands out the
     /// following number.
     last_seq: AtomicU64,
+    /// True for a handle opened with `migrate == false`: it must not write, so
+    /// `record_selection` refuses with `DictError::ReadOnlyViolation` (WR-02).
+    read_only: bool,
 }
 
 impl UserDict {
@@ -180,10 +183,12 @@ impl UserDict {
     /// dictionary is made (D-198, D-199).
     ///
     /// `migrate: false` is the reading-only entry for `sekka-dict-tool dump`: the
-    /// dictionary is opened without writing anything. Never write to a dictionary
-    /// opened that way - `record_selection` would rewrite the readings it touches
-    /// into the new shape and the legacy elements of those readings could no longer
-    /// be migrated (the ordering invariant of D-195).
+    /// dictionary is opened without writing anything. The handle is read-only:
+    /// `record_selection` returns `DictError::ReadOnlyViolation`, `save` does
+    /// nothing and `mode` is `DictionaryMode::ReadOnly`, because a write would
+    /// rewrite the readings it touches into the new shape and the legacy elements
+    /// of those readings could no longer be migrated (the ordering invariant of
+    /// D-195).
     ///
     /// User dictionaries hold on the order of a thousand keys, so building the
     /// index in one pass at startup is enough. Upstream splits the work into
@@ -238,6 +243,7 @@ impl UserDict {
             roman_index: RwLock::new(roman_index),
             symspell_index: RwLock::new(symspell_index),
             last_seq: AtomicU64::new(last_seq),
+            read_only: !migrate,
         })
     }
 
@@ -257,7 +263,14 @@ impl UserDict {
     }
 
     /// Flushes the sled database to disk
+    ///
+    /// A read-only handle (`open_with(path, false)`) never writes, so there is
+    /// nothing to flush and this does nothing - the same convention as the
+    /// `Dictionary::save` default for read-only dictionaries.
     pub fn save(&self) -> Result<(), DictError> {
+        if self.read_only {
+            return Ok(());
+        }
         self.db.flush()?;
         Ok(())
     }
@@ -417,8 +430,12 @@ impl Dictionary for UserDict {
         &self.path
     }
 
-    /// Returns the operating mode of the dictionary (read-write)
+    /// Returns the operating mode of the dictionary (read-write, or read-only for
+    /// a handle opened with `open_with(path, false)`)
     fn mode(&self) -> DictionaryMode {
+        if self.read_only {
+            return DictionaryMode::ReadOnly;
+        }
         DictionaryMode::ReadWrite
     }
 
@@ -437,6 +454,9 @@ impl Dictionary for UserDict {
     /// too (D-194): the registered word is the most recently selected word of
     /// its reading, so it heads the reading and is never duplicated (REG-06).
     fn record_selection(&self, reading: &str, word: &str) -> Result<(), DictError> {
+        if self.read_only {
+            return Err(DictError::ReadOnlyViolation);
+        }
         let seq = self.next_seq();
         self.update_entries_atomically(reading, |entries| {
             let mut found = false;
@@ -1171,7 +1191,7 @@ mod tests {
                     r#"[{"word":"感","annotation":null,"frequency":2}]"#.as_bytes(),
                 )
                 .expect("the direct write failed");
-            old.save().expect("flush failed");
+            old.db.flush().expect("flush failed");
         }
 
         let dict = UserDict::open(&dict_path).expect("failed to open the user dictionary");
@@ -1222,7 +1242,7 @@ mod tests {
                 .insert(reading.as_bytes(), json.as_bytes())
                 .expect("the direct write failed");
         }
-        old.save().expect("flush failed");
+        old.db.flush().expect("flush failed");
     }
 
     /// Every raw `(key, value)` pair of the dictionary at `path`, in key order.
@@ -1375,6 +1395,50 @@ mod tests {
     }
 
     #[test]
+    fn a_non_migrating_handle_refuses_to_record_and_leaves_legacy_rows_intact() {
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let path = tmp.path().join("test_user_dict");
+        write_v13_dictionary(&path, &[("かんじ", V13_KANJI), ("かんj", V13_KAN_J)]);
+        let before = raw_snapshot(&path);
+
+        {
+            let dict = UserDict::open_with(&path, false).expect("failed to open");
+            assert_eq!(dict.mode(), DictionaryMode::ReadOnly);
+            assert!(
+                matches!(
+                    dict.record_selection("かんじ", "漢字"),
+                    Err(DictError::ReadOnlyViolation)
+                ),
+                "recording on a non-migrating handle must be refused"
+            );
+            assert!(
+                matches!(
+                    dict.record_selection("あたらしい", "新しい"),
+                    Err(DictError::ReadOnlyViolation)
+                ),
+                "a new reading must be refused too"
+            );
+            dict.save().expect("save on a read-only handle is a no-op");
+        }
+        assert_eq!(
+            raw_snapshot(&path),
+            before,
+            "the refused writes must leave the legacy rows byte-for-byte intact"
+        );
+
+        // The migration is still possible afterwards, in the v1.3 order.
+        let dict = UserDict::open(&path).expect("failed to open");
+        assert_eq!(dict.mode(), DictionaryMode::ReadWrite);
+        let words: Vec<String> = dict
+            .lookup("かんじ")
+            .expect("lookup failed")
+            .into_iter()
+            .map(|e| e.word)
+            .collect();
+        assert_eq!(words, vec!["幹事", "漢字"]);
+    }
+
+    #[test]
     fn open_stacks_legacy_entries_above_the_numbers_already_in_use() {
         let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
         let path = tmp.path().join("test_user_dict");
@@ -1392,7 +1456,7 @@ mod tests {
             old.db
                 .insert("かんj".as_bytes(), V13_KAN_J.as_bytes())
                 .expect("the direct write failed");
-            old.save().expect("flush failed");
+            old.db.flush().expect("flush failed");
         }
 
         let dict = UserDict::open(&path).expect("failed to open");
@@ -1436,7 +1500,7 @@ mod tests {
                         .insert(format!("よみ{i}").as_bytes(), value.as_bytes())
                         .expect("the direct write failed");
                 }
-                old.save().expect("flush failed");
+                old.db.flush().expect("flush failed");
             }
 
             let started = std::time::Instant::now();
