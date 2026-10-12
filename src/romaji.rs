@@ -1124,7 +1124,7 @@ mod tests {
 
     #[test]
     fn rules_left_out_keep_their_current_output() {
-        // D-208 / D-209 / ROMA-06 / ROMA-F1: spellings that are deliberately not
+        // D-208 / D-209 / D-214 / ROMA-06 / ROMA-F1: spellings that are deliberately not
         // added keep today's output. dyu stays ぢゅ (no duplicate rule).
         for (input, expected) in [
             ("dyu", "ぢゅ"),
@@ -1144,6 +1144,12 @@ mod tests {
             ("xwa", "ゎ"),
             ("nnye", "んyえ"),
             ("n'ye", "んyえ"),
+            // D-214: same-kind spellings that got no rule; yi (ゐ) matches on its own
+            // after the pass-through letter. Carried over to ROMA-F: change these
+            // expectations when one of them is fixed.
+            ("fyi", "fゐ"),
+            ("cyi", "cゐ"),
+            ("qyi", "qゐ"),
         ] {
             assert_eq!(convert(input), expected, "input={:?}", input);
         }
@@ -1195,6 +1201,31 @@ mod tests {
             ("vyy", "vっy"),
         ] {
             assert_eq!(convert(input), expected, "input={:?}", input);
+        }
+    }
+
+    #[test]
+    fn xyi_lyi_vyi_have_their_own_rules_so_yi_no_longer_leaks_a_wi_kana() {
+        // ROMA-09 / D-213, follows Mozc. Before, x, l and v passed through and the
+        // remaining yi became ゐ (D-205).
+        for (input, expected) in [
+            ("xyi", "ぃ"),
+            ("lyi", "ぃ"),
+            ("vyi", "\u{3046}\u{309B}\u{3043}"),
+            ("Xyi", "ぃ"),
+            ("Lyi", "ぃ"),
+            ("Vyi", "\u{3046}\u{309B}\u{3043}"),
+            ("xyia", "ぃあ"),
+            ("vyia", "\u{3046}\u{309B}\u{3043}あ"),
+        ] {
+            let output = convert(input);
+            assert_eq!(output, expected, "input={:?}", input);
+            assert!(
+                !output.contains(['ゐ', '\u{3094}', '\u{3099}']),
+                "input={:?} leaked an old kana or a combining mark",
+                input
+            );
+            assert!(is_strictly_convertible(input), "input={:?}", input);
         }
     }
 }
