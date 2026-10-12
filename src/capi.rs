@@ -17,6 +17,7 @@ use std::panic::catch_unwind;
 use std::ptr;
 use std::slice;
 use std::sync::Arc;
+use std::time::Instant;
 
 use crate::context::{ConversionState, SekkaContext};
 use crate::dictionary::immutable_dict::ImmutableFileDict;
@@ -1404,6 +1405,33 @@ pub unsafe extern "C" fn sekka_context_get_registration_prompt(
     .unwrap_or(ptr::null_mut())
 }
 
+/// Returns the real-time guide text for the romaji typed so far (GUIDE-01 /
+/// GUIDE-04, Phase 16)
+///
+/// Inside the guide window this is the first candidate Ctrl-J would stage, wrapped in
+/// brackets (e.g. `[日本語]`). Outside the window, in the commit display, while
+/// reselecting and while registering a word it is an empty string (never NULL for a
+/// valid context), and the caller shows nothing. The caller must release the returned
+/// string with `sekka_free_string`. Returns NULL for a NULL pointer or on panic.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_get_guide(ctx: *mut SekkaContextFfi) -> *mut c_char {
+    if ctx.is_null() {
+        return ptr::null_mut();
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*ctx };
+        let guide = ctx.ctx.guide_text_at(Instant::now()).unwrap_or_default();
+        match CString::new(guide) {
+            Ok(cstr) => cstr.into_raw(),
+            Err(_) => ptr::null_mut(),
+        }
+    }))
+    .unwrap_or(ptr::null_mut())
+}
+
 /// Frees the memory of a candidate list
 ///
 /// Pass the return value of `sekka_context_get_candidates` straight through as
@@ -1498,6 +1526,12 @@ pub unsafe extern "C" fn sekka_context_trigger(ctx: *mut SekkaContextFfi) -> c_i
         // this, the forward flag of the previous key event would survive and a
         // trigger press would deliver the raw key to the application twice.
         ctx.forward_key = false;
+
+        // D-230 (Phase 16): every trigger key restarts the 30-second real-time guide
+        // window, whether or not it is consumed - including a pass-through with an
+        // empty buffer, a lone held `/`, reselection and conversion inside word
+        // registration.
+        ctx.ctx.extend_guide();
 
         // Phase 10: while registering, the trigger is just an ordinary key
         // routed to the innermost step (Ctrl-J conversion inside the word

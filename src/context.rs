@@ -15,6 +15,7 @@ use crate::candidate::{
 use crate::conversion::{analyze_input, classify_input_shape, split_okuri, InputShape};
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use crate::dictionary::{DictError, Dictionary, DictionaryMode, RomanKey};
 use crate::fuzzy::{fuzzy_filter_roman, FuzzySearchConfig};
@@ -308,6 +309,10 @@ pub struct SekkaContext {
     /// its own recursive field (`RegistrationSession.inner` is itself a
     /// `SekkaContext`, D-171).
     registration: Option<Box<RegistrationSession>>,
+    /// The moment the real-time guide window ends, set by every trigger key
+    /// (D-230). Only the top-level context ever sets it - the inner contexts of
+    /// word registration are created by `SekkaContext::new()` and keep `None`.
+    guide_deadline: Option<Instant>,
 }
 
 /// D-169 — only okuri-nashi `CaseBased` / all-lowercase `HiraganaConvertible`
@@ -326,6 +331,10 @@ fn is_registrable_reading(reading: &str) -> bool {
 /// `registration_prompt()` layout (each reading segment already ends in a
 /// half-width space, so the label reads naturally right after it).
 const REGISTRATION_LABEL: &str = "登録 ";
+
+/// How long the real-time guide stays on after the last trigger key (GUIDE-02 /
+/// D-229). Upstream kiyoka/sekka uses the same 30 seconds.
+pub const GUIDE_WINDOW: Duration = Duration::from_secs(30);
 
 /// One step of word registration (D-170/D-171/D-172, ARCHITECTURE case C)
 ///
@@ -371,6 +380,7 @@ impl SekkaContext {
             committed_output: None,
             last_commit: None,
             registration: None,
+            guide_deadline: None,
         }
     }
 
@@ -991,6 +1001,63 @@ impl SekkaContext {
         Some(format!("{}{}", current.draft, current.inner.get_preedit()))
     }
 
+    // === Real-time guide (GUIDE-01 to GUIDE-04, Phase 16) ===
+
+    /// Restarts the real-time guide window from now (D-230): the guide stays on for
+    /// `GUIDE_WINDOW` after the last trigger key.
+    pub fn extend_guide(&mut self) {
+        self.extend_guide_at(Instant::now());
+    }
+
+    /// Restarts the real-time guide window from `now`.
+    ///
+    /// The clock is a plain argument only so that unit tests can place the 30-second
+    /// boundary exactly without sleeping; it is deliberately not exposed through the
+    /// C ABI or any setting (D-233).
+    pub fn extend_guide_at(&mut self, now: Instant) {
+        self.guide_deadline = Some(now + GUIDE_WINDOW);
+    }
+
+    /// How much of the guide window is left at `now`, or `None` when the window was
+    /// never opened or is over. The deadline itself is already outside the window,
+    /// so a remaining time of exactly zero is `None`.
+    pub fn guide_remaining_at(&self, now: Instant) -> Option<Duration> {
+        self.guide_deadline
+            .and_then(|deadline| deadline.checked_duration_since(now))
+            .filter(|left| !left.is_zero())
+    }
+
+    /// The real-time guide text at `now`: the first candidate Ctrl-J would stage for
+    /// what is typed so far, wrapped in `[` `]` (GUIDE-01 / D-232), or `None` when
+    /// nothing is to be shown.
+    ///
+    /// `None` outside the window, in the commit display (Ctrl-J just staged a
+    /// candidate), while reselecting and while registering a word (GUIDE-04 / D-232),
+    /// and when nothing is left to convert. A held `/` at the head of the buffer is
+    /// dropped exactly once, like `convert_and_stage` does (D-221). It goes through
+    /// the same `build_candidate_list_for` as Ctrl-J, takes `&self` and never records
+    /// learning, so computing it changes nothing.
+    pub fn guide_text_at(&self, now: Instant) -> Option<String> {
+        self.guide_remaining_at(now)?;
+        if self.registration.is_some()
+            || self.state != ConversionState::Input
+            || self.last_commit.is_some()
+        {
+            return None;
+        }
+        // Without dropping the held `/` the input would fall into the symbol branch.
+        let typed = self
+            .romaji_buffer
+            .strip_prefix('/')
+            .unwrap_or(&self.romaji_buffer);
+        if typed.is_empty() {
+            return None;
+        }
+        let (candidates, _reading) = self.build_candidate_list_for(typed);
+        let first = candidates.first()?;
+        Some(format!("[{}]", first.display))
+    }
+
     /// Adds a dictionary
     ///
     /// A dictionary can be shared by several contexts.
@@ -1324,11 +1391,18 @@ impl SekkaContext {
     /// those shapes have a plain kana reading a user dictionary entry could be
     /// filed under, so registration on them is refused (D-169, a later plan).
     fn build_candidate_list(&self) -> (Vec<Candidate>, String) {
-        match classify_input_shape(&self.romaji_buffer) {
+        self.build_candidate_list_for(&self.romaji_buffer)
+    }
+
+    /// `build_candidate_list` for an explicit romaji string
+    ///
+    /// The real-time guide builds the same list as Ctrl-J for the romaji typed so far
+    /// without touching the buffer (D-232).
+    fn build_candidate_list_for(&self, romaji: &str) -> (Vec<Candidate>, String) {
+        match classify_input_shape(romaji) {
             InputShape::CaseBased | InputShape::HiraganaConvertible => {
-                let request = analyze_input(&self.romaji_buffer);
-                let (stem_romaji, okuri_romaji) =
-                    split_okuri(&self.romaji_buffer, request.okuri_position);
+                let request = analyze_input(romaji);
+                let (stem_romaji, okuri_romaji) = split_okuri(romaji, request.okuri_position);
 
                 let stem_kana = romaji_to_kana(&stem_romaji);
                 let okuri_kana = if okuri_romaji.is_empty() {
@@ -1347,21 +1421,17 @@ impl SekkaContext {
                     self.lookup_dictionary(&stem_romaji, &stem_kana, &okuri_kana, &okuri_romaji);
                 list.push(hiragana_candidate(&full_kana));
                 list.push(katakana_candidate(&full_kana));
-                list.push(alphabet_zenkaku_candidate(&self.romaji_buffer));
-                list.push(alphabet_hankaku_candidate(&self.romaji_buffer));
+                list.push(alphabet_zenkaku_candidate(romaji));
+                list.push(alphabet_hankaku_candidate(romaji));
 
                 sort_candidates(&mut list, request.mode);
                 (list, reading)
             }
-            InputShape::NumberOnly => (
-                self.build_number_candidates(&self.romaji_buffer),
-                String::new(),
-            ),
-            InputShape::NumberPrefixed => (
-                self.build_number_prefixed_candidates(&self.romaji_buffer),
-                String::new(),
-            ),
-            InputShape::Symbol => (self.build_symbol_candidates(), String::new()),
+            InputShape::NumberOnly => (self.build_number_candidates(romaji), String::new()),
+            InputShape::NumberPrefixed => {
+                (self.build_number_prefixed_candidates(romaji), String::new())
+            }
+            InputShape::Symbol => (self.build_symbol_candidates(romaji), String::new()),
         }
     }
 
@@ -1466,11 +1536,11 @@ impl SekkaContext {
     /// or katakana candidate is built and no fuzzy search is done (D-23; upstream
     /// `sekka-henkan--non-kanji`, `emacs/sekka-henkan.el:286-293`, is exact-match only).
     /// The full-width and half-width alphabet candidates (D-05) are appended at the end.
-    fn build_symbol_candidates(&self) -> Vec<Candidate> {
-        let reading = romaji_to_kana(&self.romaji_buffer);
+    fn build_symbol_candidates(&self, romaji: &str) -> Vec<Candidate> {
+        let reading = romaji_to_kana(romaji);
         let mut list = self.lookup_dictionary_exact(&reading);
-        list.push(alphabet_zenkaku_candidate(&self.romaji_buffer));
-        list.push(alphabet_hankaku_candidate(&self.romaji_buffer));
+        list.push(alphabet_zenkaku_candidate(romaji));
+        list.push(alphabet_hankaku_candidate(romaji));
         list
     }
 
@@ -1753,6 +1823,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::time::{Duration, Instant};
 
     /// Mock dictionary for tests
     ///
@@ -2017,6 +2088,62 @@ mod tests {
         assert!(ctx.get_candidates().is_empty());
         assert_eq!(ctx.get_candidate_index(), -1);
         assert!(ctx.poll_output().is_none());
+    }
+
+    // === Real-time guide tests (GUIDE-01 / D-232 / D-233, Phase 16) ===
+
+    /// A top-level context whose dictionary knows the words the guide tests use.
+    /// Every guide test builds its contexts through here so that two contexts fed
+    /// the same input see the same dictionary (D-232 equivalence checks).
+    fn guide_test_context() -> SekkaContext {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("にほんご", "日本語");
+        dict.add_entry("えいご", "英語");
+        dict.add_entry("かんじ", "漢字");
+        dict.add_entry("かんj", "感");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+        ctx
+    }
+
+    /// Types every character of `text` as ordinary key input.
+    fn guide_type(ctx: &mut SekkaContext, text: &str) {
+        for ch in text.chars() {
+            ctx.process_key(ch, false);
+        }
+    }
+
+    #[test]
+    fn guide_is_off_until_the_first_trigger() {
+        // GUIDE-02: nothing is shown before the first trigger key, however much is
+        // typed.
+        let mut ctx = guide_test_context();
+        guide_type(&mut ctx, "Nihongo");
+        assert_eq!(ctx.guide_text_at(Instant::now()), None);
+        assert_eq!(ctx.guide_remaining_at(Instant::now()), None);
+    }
+
+    #[test]
+    fn guide_shows_the_ctrl_j_first_candidate_in_brackets() {
+        // GUIDE-01 / D-232: the guide is the first candidate Ctrl-J would stage,
+        // wrapped in brackets - an uppercase head gives the dictionary word, an
+        // all-lowercase input gives the hiragana.
+        let t0 = Instant::now();
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        assert_eq!(
+            ctx.guide_text_at(t0 + Duration::from_secs(1)),
+            Some("[日本語]".to_string())
+        );
+
+        let mut lower = guide_test_context();
+        lower.extend_guide_at(t0);
+        guide_type(&mut lower, "nihongo");
+        assert_eq!(
+            lower.guide_text_at(t0 + Duration::from_secs(1)),
+            Some("[にほんご]".to_string())
+        );
     }
 
     // === Empty input handling tests ===
