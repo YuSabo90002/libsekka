@@ -214,6 +214,7 @@ pub fn split_okuri(raw_input: &str, okuri_position: Option<usize>) -> (String, S
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::romaji::romaji_to_kana;
 
     #[test]
     fn classify_input_shape_branches() {
@@ -412,18 +413,6 @@ mod tests {
         assert_eq!(okuri, "");
     }
 
-    /// Feeds a romaji string through the converter one character at a time and
-    /// returns the kana (what `romaji_to_kana` does for a stem or an okurigana).
-    fn kana_of(romaji: &str) -> String {
-        let mut converter = crate::romaji::RomajiConverter::new();
-        let mut kana = String::new();
-        for ch in romaji.chars() {
-            kana.extend(converter.feed(ch));
-        }
-        kana.extend(converter.flush());
-        kana
-    }
-
     #[test]
     fn newly_spellable_lowercase_words_move_from_symbol_to_hiragana_convertible() {
         // D-212: the v1.3 table classified these as Symbol; the new rules make them
@@ -465,6 +454,7 @@ mod tests {
         for (input, stem_kana, okuri_kana) in [
             ("kaTye", "か", "ちぇ"),
             ("kaVa", "か", "\u{3046}\u{309B}\u{3041}"),
+            ("kaVyi", "か", "\u{3046}\u{309B}\u{3043}"),
         ] {
             assert_eq!(
                 classify_input_shape(input),
@@ -482,8 +472,8 @@ mod tests {
             let (stem, okuri) = split_okuri(input, req.okuri_position);
             assert_eq!(stem, "ka", "input={:?}", input);
             assert_eq!(okuri, input[2..].to_ascii_lowercase(), "input={:?}", input);
-            assert_eq!(kana_of(&stem), stem_kana, "input={:?}", input);
-            assert_eq!(kana_of(&okuri), okuri_kana, "input={:?}", input);
+            assert_eq!(romaji_to_kana(&stem), stem_kana, "input={:?}", input);
+            assert_eq!(romaji_to_kana(&okuri), okuri_kana, "input={:?}", input);
         }
         // A leading capital alone is KanjiConvert and the whole word is the stem.
         for (input, expected) in [("Tye", "ちぇ"), ("Va", "\u{3046}\u{309B}\u{3041}")] {
@@ -497,7 +487,7 @@ mod tests {
             assert_eq!(req.mode, ConversionMode::KanjiConvert, "input={:?}", input);
             let (stem, okuri) = split_okuri(input, req.okuri_position);
             assert_eq!(okuri, "", "input={:?}", input);
-            assert_eq!(kana_of(&stem), expected, "input={:?}", input);
+            assert_eq!(romaji_to_kana(&stem), expected, "input={:?}", input);
         }
     }
 }
