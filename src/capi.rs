@@ -288,6 +288,12 @@ fn is_selecting_table_key(keysym: u32, modifiers: u32) -> bool {
 /// D-187/D-188: an Alt key that is not a printable character, and any key with
 /// Ctrl or Super (with or without Alt), stay on the D-03/D-162 commit-and-forward
 /// path.
+///
+/// D-220 (Phase 15): `/` without Ctrl/Alt/Super, with something in the romaji
+/// buffer, commits the buffer as it is and holds the `/` at the head of the buffer;
+/// Ctrl-J later drops that one `/` and converts only what follows it. With an empty
+/// buffer `/` stays on the D-158 path, and with Alt (D-185) or Ctrl/Super
+/// (D-03/D-162) it keeps its existing handling.
 fn dispatch_input(
     ctx: &mut SekkaContext,
     forward_key: &mut bool,
@@ -318,6 +324,16 @@ fn dispatch_input(
     // entry "flushing in several places" in RESEARCH.md, this happens once per
     // key event and only here).
     let flushed = ctx.flush_last_commit();
+
+    // D-220 (Phase 15): `/` with something in the romaji buffer commits the buffer as
+    // it is (the left side is not converted) and holds the `/` at the head of the
+    // buffer; with an empty buffer it falls through to D-158 below as before
+    // (SLASH-04). Placed after the single flush so that a true `flushed` (romaji
+    // buffer empty) and a held `/` can never both happen.
+    if !ctrl && !other && keysym == 0x2F && ctx.commit_and_hold_slash() {
+        debug_assert!(!flushed);
+        return 1;
+    }
 
     if !ctrl && !other && is_romaji_char(keysym) {
         ctx.process_key(keysym as u8 as char, false);

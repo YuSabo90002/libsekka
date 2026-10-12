@@ -446,6 +446,33 @@ impl SekkaContext {
         true
     }
 
+    /// Commits the romaji buffer as it is and holds a `/` at the head of the buffer
+    /// (D-219/D-220, Phase 15)
+    ///
+    /// The slash separator: what was typed before the `/` is not converted but
+    /// committed as it is, and the `/` waits at the head of the romaji buffer (no
+    /// separate flag). Ctrl-J later drops exactly that one `/` and converts only what
+    /// follows it (`convert_and_stage`, D-221). A buffer that is already just a held
+    /// `/` is committed as the character and a new `/` is held (a chain of slashes).
+    ///
+    /// # Returns
+    /// true when the buffer was not empty in the Input state (it was committed and a
+    /// `/` is now held); false when nothing happened (the buffer was empty or the
+    /// state is not Input), in which case the caller falls through to D-158.
+    pub fn commit_and_hold_slash(&mut self) -> bool {
+        if self.state != ConversionState::Input || self.romaji_buffer.is_empty() {
+            return false;
+        }
+        debug_assert!(
+            self.last_commit.is_none() || self.romaji_buffer.is_empty(),
+            "the romaji buffer is empty in the commit display state (revised D-08)"
+        );
+        self.commit_raw_romaji();
+        self.romaji_buffer.push('/');
+        self.preedit = self.romaji_buffer.clone();
+        true
+    }
+
     /// Commits whatever this key event commits and appends `ch` to it (D-158)
     ///
     /// Calls `commit_raw_romaji()` first (its own D-12 flush and romaji-buffer
@@ -1183,6 +1210,22 @@ impl SekkaContext {
     fn convert_and_stage(&mut self) -> bool {
         if self.romaji_buffer.is_empty() {
             return false;
+        }
+
+        // D-221a (Phase 15): a held `/` with nothing after it has nothing to convert;
+        // the key is consumed and nothing changes. Returning false would hand Ctrl-J
+        // to the application.
+        if self.romaji_buffer == "/" {
+            return true;
+        }
+
+        // D-221 (Phase 15): drop exactly one held `/` before `build_candidate_list`,
+        // so the candidates, the reading used for registration and learning never
+        // contain it. `analyze_input` reads the first character and byte offsets, so
+        // this must come first.
+        let held_slash = self.romaji_buffer.starts_with('/');
+        if held_slash {
+            self.romaji_buffer.remove(0);
         }
 
         // Move to the Converting state.
