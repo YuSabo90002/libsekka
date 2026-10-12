@@ -2241,7 +2241,11 @@ mod tests {
 
         guide_type(ctx.active_mut(), "Eigo");
         assert_eq!(ctx.guide_text_at(at), None, "outer step");
-        assert_eq!(ctx.active().guide_remaining_at(at), None, "inner step has no window");
+        assert_eq!(
+            ctx.active().guide_remaining_at(at),
+            None,
+            "inner step has no window"
+        );
 
         assert!(ctx.active_mut().process_key('\0', true));
         assert!(ctx.active_mut().begin_registration());
