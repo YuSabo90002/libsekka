@@ -1246,22 +1246,25 @@ impl SekkaContext {
         // observed during the RED evaluation of this task).
         let mut raw_romaji = std::mem::take(&mut self.romaji_buffer);
 
+        // D-222 (Phase 15): put the held `/` back into `raw_romaji` only, so BackSpace
+        // (D-160/D-161, `backspace` unchanged) restores it; the candidates and
+        // `reading` above were built without it. This is done before the branch so
+        // that the empty-candidates branch below also keeps the `/` (SLASH-05: a held
+        // `/` is never silently dropped).
+        if held_slash {
+            raw_romaji.insert(0, '/');
+        }
+
         if self.candidates.is_empty() {
             // When the candidate list came out empty (a defensive case that D-05 should
-            // normally prevent): commit the romaji buffer contents as they are, with no
-            // reselection available.
+            // normally prevent): commit the romaji buffer contents as they are (the held
+            // `/` included), with no reselection available.
             self.committed_output = Some(raw_romaji);
             self.last_commit = None;
             self.preedit.clear();
         } else {
             let text = self.candidates[0].display.clone();
             self.preedit = text.clone();
-            // D-222 (Phase 15): put the held `/` back into `raw_romaji` only, so
-            // BackSpace (D-160/D-161, `backspace` unchanged) restores it; the
-            // candidates and `reading` above were built without it.
-            if held_slash {
-                raw_romaji.insert(0, '/');
-            }
             self.last_commit = Some(LastCommit {
                 text,
                 candidates: std::mem::take(&mut self.candidates),
