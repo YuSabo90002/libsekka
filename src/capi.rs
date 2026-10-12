@@ -724,6 +724,19 @@ pub unsafe extern "C" fn sekka_context_process_key_event(
             return 0;
         }
 
+        // D-231 (Phase 16): Ctrl-G closes the real-time guide window in every state -
+        // with romaji (committed and forwarded, D-03), while reselecting (cancel,
+        // D-09), while registering (cancel the step, D-174) and with nothing at all
+        // (passed through). Only the guide is touched here; what the key itself does
+        // below is unchanged. Same modifier rule as the existing cancel: Ctrl without
+        // Alt or Super.
+        if (modifiers & MOD_CTRL) != 0
+            && (modifiers & (MOD_ALT | MOD_SUPER)) == 0
+            && ctrl_letter(keysym, b'g')
+        {
+            ctx.ctx.stop_guide();
+        }
+
         // Phase 10: while registering, every key is consumed by the
         // registration mode itself (REG-02 - nothing is ever forwarded to the
         // application from here). `handle_registration_key` routes to the
@@ -1430,6 +1443,33 @@ pub unsafe extern "C" fn sekka_context_get_guide(ctx: *mut SekkaContextFfi) -> *
         }
     }))
     .unwrap_or(ptr::null_mut())
+}
+
+/// Returns the milliseconds left of the real-time guide window (GUIDE-02, Phase 16)
+///
+/// Rounded up so that a timer armed with it never fires before the deadline (D-229).
+/// 0 when the window is closed or has run out. Returns 0 for a NULL pointer or on
+/// panic.
+///
+/// # Safety
+/// `ctx` must be NULL or an unfreed pointer returned by `sekka_context_new`.
+#[no_mangle]
+pub unsafe extern "C" fn sekka_context_guide_remaining_ms(ctx: *mut SekkaContextFfi) -> c_int {
+    if ctx.is_null() {
+        return 0;
+    }
+    catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let ctx = unsafe { &*ctx };
+        match ctx.ctx.guide_remaining_at(Instant::now()) {
+            Some(left) => {
+                // Cap before adding the rounding 1 so the addition cannot overflow.
+                let capped = left.as_millis().min((c_int::MAX - 1) as u128) as c_int;
+                capped + 1
+            }
+            None => 0,
+        }
+    }))
+    .unwrap_or(0)
 }
 
 /// Frees the memory of a candidate list

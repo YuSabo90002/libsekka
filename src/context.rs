@@ -664,6 +664,9 @@ impl SekkaContext {
         // holds) is dropped here, laying the groundwork for D-180 (a later
         // plan handles what happens to a registration session on focus loss).
         self.registration = None;
+        // D-231 (Phase 16): a focus change, an input method switch or an explicit reset
+        // closes the real-time guide window until the next trigger key.
+        self.guide_deadline = None;
     }
 
     /// Returns the current conversion state
@@ -1016,6 +1019,14 @@ impl SekkaContext {
     /// C ABI or any setting (D-233).
     pub fn extend_guide_at(&mut self, now: Instant) {
         self.guide_deadline = Some(now + GUIDE_WINDOW);
+    }
+
+    /// Closes the real-time guide window until the next trigger key.
+    ///
+    /// Ctrl-G calls this in every state (D-231); the key's own effect (commit and
+    /// forward, cancel, nothing) is decided elsewhere and is not touched here.
+    pub fn stop_guide(&mut self) {
+        self.guide_deadline = None;
     }
 
     /// How much of the guide window is left at `now`, or `None` when the window was
@@ -2326,6 +2337,38 @@ mod tests {
         guide_type(&mut plain, "Kanji");
         assert!(plain.process_key('\0', true));
         assert_eq!(ctx.get_preedit(), plain.get_preedit());
+    }
+
+    #[test]
+    fn guide_stop_closes_the_window_until_the_next_trigger() {
+        // D-231: Ctrl-G stops the guide; it stays off until the next trigger key.
+        let t0 = Instant::now();
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        ctx.stop_guide();
+        assert_eq!(ctx.guide_text_at(t0 + Duration::from_secs(1)), None);
+        assert_eq!(ctx.guide_remaining_at(t0 + Duration::from_secs(1)), None);
+
+        ctx.extend_guide_at(t0 + Duration::from_secs(2));
+        assert_eq!(
+            ctx.guide_text_at(t0 + Duration::from_secs(3)),
+            Some("[日本語]".to_string())
+        );
+    }
+
+    #[test]
+    fn guide_window_is_closed_by_reset() {
+        // D-231 / D-14 / D-15: a focus change, an input method switch or an explicit
+        // reset closes the window; typing afterwards shows nothing.
+        let t0 = Instant::now();
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        ctx.reset();
+        assert_eq!(ctx.guide_remaining_at(t0 + Duration::from_secs(1)), None);
+        guide_type(&mut ctx, "Eigo");
+        assert_eq!(ctx.guide_text_at(t0 + Duration::from_secs(1)), None);
     }
 
     // === Empty input handling tests ===
