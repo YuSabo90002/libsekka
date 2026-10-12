@@ -2227,8 +2227,10 @@ mod tests {
     #[test]
     fn guide_is_hidden_while_registering_at_every_step() {
         // D-232: nothing is shown while registering a word - neither on the outer
-        // context nor on the inner one the keys are routed to, and not on a nested
-        // registration step either.
+        // context nor on a nested registration step. The inner contexts the keys are
+        // routed to never own a window (only the outermost context does), so for them
+        // the test pins "no window" itself; asking an inner context for its guide text
+        // would return `None` even without the registration guard.
         let t0 = Instant::now();
         let at = t0 + Duration::from_secs(1);
         let mut ctx = guide_test_context();
@@ -2239,13 +2241,17 @@ mod tests {
 
         guide_type(ctx.active_mut(), "Eigo");
         assert_eq!(ctx.guide_text_at(at), None, "outer step");
-        assert_eq!(ctx.active().guide_text_at(at), None, "inner step");
+        assert_eq!(ctx.active().guide_remaining_at(at), None, "inner step has no window");
 
         assert!(ctx.active_mut().process_key('\0', true));
         assert!(ctx.active_mut().begin_registration());
         guide_type(ctx.active_mut(), "Kanji");
         assert_eq!(ctx.guide_text_at(at), None, "outer step, nested");
-        assert_eq!(ctx.active().guide_text_at(at), None, "innermost step");
+        assert_eq!(
+            ctx.active().guide_remaining_at(at),
+            None,
+            "innermost step has no window"
+        );
     }
 
     #[test]
