@@ -1244,7 +1244,7 @@ impl SekkaContext {
         // of the assignment. Clearing the buffer after assigning last_commit instead makes
         // the invariant check right after the assignment report a genuine bug (actually
         // observed during the RED evaluation of this task).
-        let raw_romaji = std::mem::take(&mut self.romaji_buffer);
+        let mut raw_romaji = std::mem::take(&mut self.romaji_buffer);
 
         if self.candidates.is_empty() {
             // When the candidate list came out empty (a defensive case that D-05 should
@@ -1256,6 +1256,12 @@ impl SekkaContext {
         } else {
             let text = self.candidates[0].display.clone();
             self.preedit = text.clone();
+            // D-222 (Phase 15): put the held `/` back into `raw_romaji` only, so
+            // BackSpace (D-160/D-161, `backspace` unchanged) restores it; the
+            // candidates and `reading` above were built without it.
+            if held_slash {
+                raw_romaji.insert(0, '/');
+            }
             self.last_commit = Some(LastCommit {
                 text,
                 candidates: std::mem::take(&mut self.candidates),
