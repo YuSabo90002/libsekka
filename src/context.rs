@@ -18,7 +18,7 @@ use std::sync::Arc;
 
 use crate::dictionary::{DictError, Dictionary, DictionaryMode, RomanKey};
 use crate::fuzzy::{fuzzy_filter_roman, FuzzySearchConfig};
-use crate::romaji::RomajiConverter;
+use crate::romaji::romaji_to_kana;
 use crate::roman_index;
 use crate::symspell;
 
@@ -1278,11 +1278,11 @@ impl SekkaContext {
                 let (stem_romaji, okuri_romaji) =
                     split_okuri(&self.romaji_buffer, request.okuri_position);
 
-                let stem_kana = self.romaji_to_kana(&stem_romaji);
+                let stem_kana = romaji_to_kana(&stem_romaji);
                 let okuri_kana = if okuri_romaji.is_empty() {
                     String::new()
                 } else {
-                    self.romaji_to_kana(&okuri_romaji)
+                    romaji_to_kana(&okuri_romaji)
                 };
                 let full_kana = format!("{}{}", stem_kana, okuri_kana);
                 let reading = if okuri_romaji.is_empty() {
@@ -1388,7 +1388,7 @@ impl SekkaContext {
     /// candidate is built and the candidates are not reordered (D-23/D-24).
     fn build_number_prefixed_candidates(&self, raw_input: &str) -> Vec<Candidate> {
         let (replaced, num_runs) = replace_digit_runs_with_hash(raw_input);
-        let reading = self.romaji_to_kana(&replaced);
+        let reading = romaji_to_kana(&replaced);
 
         let dict_candidates = self.lookup_dictionary(&replaced, &reading, "", "");
 
@@ -1415,7 +1415,7 @@ impl SekkaContext {
     /// `sekka-henkan--non-kanji`, `emacs/sekka-henkan.el:286-293`, is exact-match only).
     /// The full-width and half-width alphabet candidates (D-05) are appended at the end.
     fn build_symbol_candidates(&self) -> Vec<Candidate> {
-        let reading = self.romaji_to_kana(&self.romaji_buffer);
+        let reading = romaji_to_kana(&self.romaji_buffer);
         let mut list = self.lookup_dictionary_exact(&reading);
         list.push(alphabet_zenkaku_candidate(&self.romaji_buffer));
         list.push(alphabet_hankaku_candidate(&self.romaji_buffer));
@@ -1676,21 +1676,6 @@ impl SekkaContext {
         }
 
         all_candidates
-    }
-
-    /// Helper that converts a romaji string into kana
-    fn romaji_to_kana(&self, romaji: &str) -> String {
-        let mut converter = RomajiConverter::new();
-        let mut result = String::new();
-        for ch in romaji.chars() {
-            for s in converter.feed(ch) {
-                result.push_str(&s);
-            }
-        }
-        for s in converter.flush() {
-            result.push_str(&s);
-        }
-        result
     }
 
     /// Updates the preedit with the currently selected candidate

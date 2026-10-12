@@ -246,6 +246,25 @@ pub fn is_strictly_convertible(input: &str) -> bool {
     buffer.is_empty() || buffer == "n"
 }
 
+/// Converts a whole romaji string into kana
+///
+/// This is the one production romaji-to-kana conversion (stem, okurigana, a
+/// reading with digits replaced by `#`, and the buffer of symbol input). Tests
+/// call this instead of copying the steps (ROMA-08, D-216).
+pub fn romaji_to_kana(romaji: &str) -> String {
+    let mut converter = RomajiConverter::new();
+    let mut result = String::new();
+    for ch in romaji.chars() {
+        for s in converter.feed(ch) {
+            result.push_str(&s);
+        }
+    }
+    for s in converter.flush() {
+        result.push_str(&s);
+    }
+    result
+}
+
 /// Builds the full romaji rule table
 fn build_romaji_rules() -> Vec<RomajiRule> {
     let mut rules = Vec::new();
@@ -497,6 +516,9 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("vi", "\u{3046}\u{309B}\u{3043}");
     rule!("ve", "\u{3046}\u{309B}\u{3047}");
     rule!("vo", "\u{3046}\u{309B}\u{3049}");
+    // vyi (D-213, ROMA-09): without it yi (-> ゐ, D-205) matched on its own and
+    // left a bare v in front.
+    rule!("vyi", "\u{3046}\u{309B}\u{3043}");
 
     // === Small kana (x/l prefix) ===
     rule!("xa", "ぁ");
@@ -963,7 +985,8 @@ mod tests {
         );
         // 151 (v1.3 table) + 46 (D-205): 16 -ye, 13 -yi, 6 W row (whi whe who yi
         // wyi wye), 5 V row, 4 small kana (lya lyu lyo lwa), 2 (thu dhu)
-        assert_eq!(conv.rules.len(), 197);
+        // + 1 (D-213: vyi)
+        assert_eq!(conv.rules.len(), 198);
     }
 
     #[test]
@@ -1153,6 +1176,25 @@ mod tests {
                 "input={:?}",
                 input
             );
+        }
+    }
+
+    #[test]
+    fn vy_becoming_a_prefix_does_not_change_the_other_vy_inputs() {
+        // D-215: vyi makes vy a prefix of a rule; the final output of every other
+        // input that starts with vy stays the same. Only the intermediate buffer
+        // changes, and production never reads it (14-RESEARCH Pitfall 3).
+        for (input, expected) in [
+            ("vy", "vy"),
+            ("vya", "vや"),
+            ("vyu", "vゆ"),
+            ("vye", "vyえ"),
+            ("vyo", "vよ"),
+            ("vyn", "vyん"),
+            ("vyk", "vyk"),
+            ("vyy", "vっy"),
+        ] {
+            assert_eq!(convert(input), expected, "input={:?}", input);
         }
     }
 }
