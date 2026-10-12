@@ -1046,10 +1046,8 @@ impl SekkaContext {
             return None;
         }
         // Without dropping the held `/` the input would fall into the symbol branch.
-        let typed = self
-            .romaji_buffer
-            .strip_prefix('/')
-            .unwrap_or(&self.romaji_buffer);
+        let without_slash = self.romaji_buffer.strip_prefix('/');
+        let typed = without_slash.unwrap_or(&self.romaji_buffer);
         if typed.is_empty() {
             return None;
         }
@@ -2144,6 +2142,190 @@ mod tests {
             lower.guide_text_at(t0 + Duration::from_secs(1)),
             Some("[にほんご]".to_string())
         );
+    }
+
+    #[test]
+    fn guide_window_shows_at_29_999_seconds_and_not_at_30_000() {
+        // GUIDE-02 / D-233: the window closes exactly 30 seconds after the trigger;
+        // the deadline itself is already outside it. The clock is injected, so no
+        // test sleeps.
+        let t0 = Instant::now();
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+
+        assert_eq!(
+            ctx.guide_text_at(t0 + Duration::from_millis(29_999)),
+            Some("[日本語]".to_string())
+        );
+        assert_eq!(ctx.guide_text_at(t0 + Duration::from_millis(30_000)), None);
+        assert_eq!(ctx.guide_text_at(t0 + Duration::from_millis(30_001)), None);
+        assert_eq!(
+            ctx.guide_remaining_at(t0 + Duration::from_millis(29_999)),
+            Some(Duration::from_millis(1))
+        );
+        assert_eq!(
+            ctx.guide_remaining_at(t0 + Duration::from_millis(30_000)),
+            None
+        );
+    }
+
+    #[test]
+    fn guide_window_is_extended_by_a_later_trigger() {
+        // D-230 (the time side): a later trigger moves the deadline to 30 seconds
+        // after itself.
+        let t0 = Instant::now();
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        ctx.extend_guide_at(t0 + Duration::from_secs(20));
+
+        assert_eq!(
+            ctx.guide_text_at(t0 + Duration::from_millis(49_999)),
+            Some("[日本語]".to_string())
+        );
+        assert_eq!(ctx.guide_text_at(t0 + Duration::from_millis(50_000)), None);
+    }
+
+    #[test]
+    fn guide_is_hidden_in_the_commit_display_and_during_reselection() {
+        // D-232: nothing is shown while Ctrl-J's first candidate is on screen (commit
+        // display) or while choosing again among candidates; the window itself stays
+        // open, so the guide is back as soon as new romaji is typed.
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(1);
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        assert!(ctx.guide_text_at(at).is_some());
+
+        assert!(ctx.process_key('\0', true));
+        assert_eq!(ctx.guide_text_at(at), None, "commit display");
+
+        assert!(ctx.process_key('\0', true));
+        assert_eq!(ctx.state(), ConversionState::Selecting);
+        assert_eq!(ctx.guide_text_at(at), None, "reselecting");
+
+        ctx.cancel();
+        assert_eq!(ctx.guide_text_at(at), None, "commit display after cancel");
+
+        ctx.process_key('E', false);
+        assert!(ctx.guide_text_at(at).is_some(), "window is still open");
+    }
+
+    #[test]
+    fn guide_is_hidden_while_registering_at_every_step() {
+        // D-232: nothing is shown while registering a word - neither on the outer
+        // context nor on the inner one the keys are routed to, and not on a nested
+        // registration step either.
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(1);
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Nihongo");
+        assert!(ctx.process_key('\0', true));
+        assert!(ctx.begin_registration());
+
+        guide_type(ctx.active_mut(), "Eigo");
+        assert_eq!(ctx.guide_text_at(at), None, "outer step");
+        assert_eq!(ctx.active().guide_text_at(at), None, "inner step");
+
+        assert!(ctx.active_mut().process_key('\0', true));
+        assert!(ctx.active_mut().begin_registration());
+        guide_type(ctx.active_mut(), "Kanji");
+        assert_eq!(ctx.guide_text_at(at), None, "outer step, nested");
+        assert_eq!(ctx.active().guide_text_at(at), None, "innermost step");
+    }
+
+    #[test]
+    fn guide_uses_only_the_romaji_after_a_held_slash() {
+        // D-232 / D-221: a held `/` at the head of the buffer is dropped exactly once,
+        // like Ctrl-J does; a lone `/` has nothing to show.
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(1);
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Linux");
+        assert!(ctx.commit_and_hold_slash());
+        assert_eq!(ctx.guide_text_at(at), None, "a lone held slash");
+        guide_type(&mut ctx, "Nihongo");
+        assert_eq!(ctx.guide_text_at(at), Some("[日本語]".to_string()));
+        assert_eq!(ctx.poll_output(), Some("Linux".to_string()));
+
+        // A chain of slashes: the first is committed, a new one is held, so only a
+        // lone `/` is left again.
+        let mut chained = guide_test_context();
+        chained.extend_guide_at(t0);
+        chained.process_key('Z', false);
+        assert!(chained.commit_and_hold_slash());
+        assert!(chained.commit_and_hold_slash());
+        assert_eq!(
+            chained.guide_text_at(at),
+            None,
+            "a held slash after a chain"
+        );
+
+        // Nothing typed at all.
+        let mut empty = guide_test_context();
+        empty.extend_guide_at(t0);
+        assert_eq!(empty.guide_text_at(at), None, "empty buffer");
+    }
+
+    #[test]
+    fn guide_matches_the_ctrl_j_first_candidate_for_every_input_shape() {
+        // D-232 (RESEARCH Pattern 2, measured): for every input shape the guide is
+        // exactly what Ctrl-J would put in the preedit, in brackets.
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(1);
+        let inputs = [
+            "Nihongo", "nihongo", "Kanji", "kaNji", "and", "123", "1ji", ".", "yuwe", "Kanj",
+            "nihogno", "c", "-", "?!",
+        ];
+        for input in inputs {
+            let mut guided = guide_test_context();
+            guided.extend_guide_at(t0);
+            guide_type(&mut guided, input);
+            let guide = guided.guide_text_at(at);
+
+            let mut converted = guide_test_context();
+            guide_type(&mut converted, input);
+            assert!(
+                converted.process_key('\0', true),
+                "Ctrl-J did not stage {input:?}"
+            );
+            let expected = format!("[{}]", converted.get_preedit());
+
+            assert_eq!(
+                guide,
+                Some(expected),
+                "guide differs from Ctrl-J for {input:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn guide_leaves_the_buffer_and_the_next_conversion_unchanged() {
+        // D-232 (non-destructive): computing the guide must not touch the buffer, the
+        // state or any output, and the Ctrl-J after it must give the same result as
+        // Ctrl-J with no guide in between.
+        let t0 = Instant::now();
+        let at = t0 + Duration::from_secs(1);
+        let mut ctx = guide_test_context();
+        ctx.extend_guide_at(t0);
+        guide_type(&mut ctx, "Kanji");
+        let before = ctx.get_preedit().to_string();
+
+        assert!(ctx.guide_text_at(at).is_some());
+        assert!(ctx.guide_text_at(at).is_some());
+        assert_eq!(ctx.get_preedit(), before);
+        assert_eq!(ctx.state(), ConversionState::Input);
+        assert_eq!(ctx.poll_output(), None);
+
+        assert!(ctx.process_key('\0', true));
+        let mut plain = guide_test_context();
+        guide_type(&mut plain, "Kanji");
+        assert!(plain.process_key('\0', true));
+        assert_eq!(ctx.get_preedit(), plain.get_preedit());
     }
 
     // === Empty input handling tests ===
