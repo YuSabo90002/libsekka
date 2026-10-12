@@ -534,6 +534,8 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("xya", "ゃ");
     rule!("xyu", "ゅ");
     rule!("xyo", "ょ");
+    // xyi (D-213, ROMA-09): without it yi (-> ゐ, D-205) matched on its own.
+    rule!("xyi", "ぃ");
     rule!("xtu", "っ");
     rule!("ltu", "っ");
     rule!("xtsu", "っ");
@@ -542,6 +544,8 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
     rule!("lya", "ゃ");
     rule!("lyu", "ゅ");
     rule!("lyo", "ょ");
+    // lyi (D-213, ROMA-09): without it yi (-> ゐ, D-205) matched on its own.
+    rule!("lyi", "ぃ");
     rule!("lwa", "ゎ");
 
     // === Special combinations ===
@@ -571,19 +575,9 @@ fn build_romaji_rules() -> Vec<RomajiRule> {
 mod tests {
     use super::*;
 
-    /// Helper that feeds a whole string character by character and joins the result
+    /// Helper that converts a whole string with the production conversion (D-216)
     fn convert(input: &str) -> String {
-        let mut converter = RomajiConverter::new();
-        let mut result = String::new();
-        for ch in input.chars() {
-            for s in converter.feed(ch) {
-                result.push_str(&s);
-            }
-        }
-        for s in converter.flush() {
-            result.push_str(&s);
-        }
-        result
+        romaji_to_kana(input)
     }
 
     // The 151 rules of the v1.3 table (commit 087c7a0), generated from the source
@@ -985,8 +979,8 @@ mod tests {
         );
         // 151 (v1.3 table) + 46 (D-205): 16 -ye, 13 -yi, 6 W row (whi whe who yi
         // wyi wye), 5 V row, 4 small kana (lya lyu lyo lwa), 2 (thu dhu)
-        // + 1 (D-213: vyi)
-        assert_eq!(conv.rules.len(), 198);
+        // + 3 (D-213: xyi lyi vyi)
+        assert_eq!(conv.rules.len(), 200);
     }
 
     #[test]
@@ -1097,7 +1091,7 @@ mod tests {
 
     #[test]
     fn l_small_lya_lyu_lyo_lwa_produce_small_kana() {
-        // ROMA-05 / D-205. lyi is not in D-205 and is not added.
+        // ROMA-05 / D-205.
         assert_eq!(convert("lya"), "ゃ");
         assert_eq!(convert("lyu"), "ゅ");
         assert_eq!(convert("lyo"), "ょ");
