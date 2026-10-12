@@ -171,6 +171,12 @@ pub const KANA_TO_HEPBURN: &[(&str, &str)] = &[
     ("りぇ", "rye"),
     // WA row
     ("わ", "wa"),
+    // ゐ -> wi and ゑ -> we are intended (ROMA-07, D-217). This table is the index
+    // side of the fuzzy layer, so a word whose reading has ゐ/ゑ (learned or
+    // registered up to v1.3) is found by typing the old spellings wi/we, which the
+    // input side no longer turns into ゐ/ゑ (v1.4 types them with yi, wyi and wye).
+    // The rest of this table's asymmetries are ROMA-F2, together with regenerating
+    // the master dictionary.
     ("ゐ", "wi"),
     ("ゑ", "we"),
     ("を", "wo"),
@@ -304,5 +310,13 @@ mod tests {
     #[test]
     fn long_vowel_mark_becomes_a_hyphen() {
         assert_eq!(kana_to_hepburn("ー"), "-");
+    }
+
+    #[test]
+    fn yuwe_romanizes_the_old_we_kana_as_we() {
+        // ROMA-07 / D-217: the index spelling of ゑ is we, so the fuzzy layer can
+        // match the raw romaji yuwe against a reading ゆゑ.
+        assert_eq!(kana_to_hepburn("ゆゑ"), "yuwe");
+        assert_eq!(kana_to_hepburn("あゐ"), "awi");
     }
 }
