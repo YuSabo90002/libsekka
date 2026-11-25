@@ -50,6 +50,11 @@ pub struct ConversionRequest {
 /// - uppercase head plus uppercase inside or at the end -> `OkuriMarker`
 /// - lowercase head plus uppercase inside -> `KanjiWithOkuri`
 ///
+/// With an uppercase head, an uppercase letter typed before the stem has settled
+/// any kana does not start the okurigana: "KAnji" decides like "Kanji" (see
+/// `find_okuri_start_after_uppercase_head`). `raw_input` itself is never
+/// rewritten.
+///
 /// # Arguments
 ///
 /// * `raw_input` - the raw romaji input string
@@ -70,8 +75,14 @@ pub fn analyze_input(raw_input: &str) -> ConversionRequest {
     let first_char = raw_input.chars().next().unwrap();
     let first_is_upper = first_char.is_ascii_uppercase();
 
-    // Find the first uppercase letter from the second character on (byte offset).
-    let second_upper_pos = find_second_uppercase(raw_input);
+    // Find the uppercase letter that starts the okurigana (byte offset). With an
+    // uppercase head, capitals typed before any kana has been settled are read as
+    // lowercase (the SKK rule for "KAnji").
+    let second_upper_pos = if first_is_upper {
+        find_okuri_start_after_uppercase_head(raw_input)
+    } else {
+        find_second_uppercase(raw_input)
+    };
 
     let (mode, okuri_position) = match (first_is_upper, second_upper_pos) {
         // lowercase head, no uppercase -> hiragana only
@@ -182,6 +193,33 @@ fn find_second_uppercase(input: &str) -> Option<usize> {
     for (byte_pos, ch) in chars {
         if ch.is_ascii_uppercase() {
             return Some(byte_pos);
+        }
+    }
+    None
+}
+
+/// Returns the byte offset of the uppercase letter that starts the okurigana
+/// in input with an uppercase head, following the SKK rule.
+///
+/// Walks the input once, feeding each character (lowercased) to a fresh
+/// `RomajiConverter` without ever flushing it. An uppercase letter from the
+/// second character on starts the okurigana only when `feed` has already
+/// returned at least one output (kana or a passed-through character, User
+/// ruling D1); before that it is read as lowercase and the walk goes on. A lone
+/// `n` or a consonant waiting for its vowel produces no output from `feed`, so
+/// "KAnji", "SHIneru", "KYOu" and "NAka" have no okurigana, while "KAnJi"
+/// starts it at the `J` and "KANJI" at the `N`.
+///
+/// Returns `None` when no uppercase letter qualifies.
+fn find_okuri_start_after_uppercase_head(input: &str) -> Option<usize> {
+    let mut converter = crate::romaji::RomajiConverter::new();
+    let mut settled = false;
+    for (index, (byte_pos, ch)) in input.char_indices().enumerate() {
+        if index > 0 && ch.is_ascii_uppercase() && settled {
+            return Some(byte_pos);
+        }
+        if !converter.feed(ch).is_empty() {
+            settled = true;
         }
     }
     None
@@ -489,5 +527,110 @@ mod tests {
             assert_eq!(okuri, "", "input={:?}", input);
             assert_eq!(romaji_to_kana(&stem), expected, "input={:?}", input);
         }
+    }
+
+    /// Asserts that `typed` decides the same mode and okurigana position as
+    /// `intended`, while keeping its own raw input.
+    fn assert_same_decision(typed: &str, intended: &str) {
+        let got = analyze_input(typed);
+        let want = analyze_input(intended);
+        assert_eq!(
+            got.mode, want.mode,
+            "typed={:?} intended={:?}",
+            typed, intended
+        );
+        assert_eq!(
+            got.okuri_position, want.okuri_position,
+            "typed={:?} intended={:?}",
+            typed, intended
+        );
+        assert_eq!(got.raw_input, typed, "the raw input is never rewritten");
+    }
+
+    #[test]
+    fn uppercase_rescue_lowers_a_second_capital_after_a_consonant_only_stem() {
+        // SC1: no kana has been settled before the second capital, so it is read as
+        // lowercase (the SKK rule for KAnji).
+        for (typed, intended) in [
+            ("KAnji", "Kanji"),
+            ("SHIneru", "Shineru"),
+            ("KYOu", "Kyou"),
+            ("NAka", "Naka"),
+        ] {
+            assert_same_decision(typed, intended);
+            let req = analyze_input(typed);
+            assert_eq!(req.mode, ConversionMode::KanjiConvert, "typed={:?}", typed);
+            assert_eq!(req.okuri_position, None, "typed={:?}", typed);
+        }
+        let req = analyze_input("KAnji");
+        assert_eq!(req.raw_input, "KAnji");
+        assert_eq!(req.kana_reading, "kanji");
+    }
+
+    #[test]
+    fn uppercase_rescue_treats_a_lone_n_stem_as_a_pending_consonant() {
+        // E2 (held-out): a lone `n` would become ん on flush, but SKK keeps it
+        // pending, so `NAka` decides like `Naka`.
+        assert_same_decision("NAka", "Naka");
+        assert_eq!(analyze_input("NAka").okuri_position, None);
+    }
+
+    #[test]
+    fn uppercase_rescue_rechecks_after_lowering_the_first_hit() {
+        // E3 (held-out): only the `A` is lowered; by the `J` kana has been settled,
+        // so `KAnJi` decides like `KanJi`.
+        assert_same_decision("KAnJi", "KanJi");
+        let req = analyze_input("KAnJi");
+        assert_eq!(req.mode, ConversionMode::OkuriMarker);
+        assert_eq!(req.okuri_position, Some(3));
+    }
+
+    #[test]
+    fn uppercase_rescue_leaves_a_lowercase_head_unchanged() {
+        // E4 (held-out): a lowercase head is outside the rule.
+        let req = analyze_input("kAnji");
+        assert_eq!(req.mode, ConversionMode::KanjiWithOkuri);
+        assert_eq!(req.okuri_position, Some(1));
+        assert_eq!(req.raw_input, "kAnji");
+    }
+
+    #[test]
+    fn uppercase_rescue_reads_all_caps_as_second_letter_lowered() {
+        // E5 (held-out): all caps gets no special case; it reads as `KaNJI`.
+        assert_same_decision("KANJI", "KaNJI");
+        let req = analyze_input("KANJI");
+        assert_eq!(req.mode, ConversionMode::OkuriMarker);
+        assert_eq!(req.okuri_position, Some(2));
+    }
+
+    #[test]
+    fn uppercase_rescue_counts_passed_through_characters_as_output() {
+        // User ruling D1 (a): any output of `feed`, kana or a passed-through
+        // character, counts, so these keep an okurigana split.
+        for (typed, position) in [("XnAka", 2), ("K1Anji", 2), ("KSHIneru", 2)] {
+            let req = analyze_input(typed);
+            assert_eq!(req.mode, ConversionMode::OkuriMarker, "typed={:?}", typed);
+            assert_eq!(req.okuri_position, Some(position), "typed={:?}", typed);
+        }
+    }
+
+    #[test]
+    fn uppercase_rescue_keeps_okurigana_once_kana_is_settled() {
+        // E1 / SC2: once the stem has settled kana, the capital starts the
+        // okurigana as before.
+        for (typed, mode, position) in [
+            ("AU", ConversionMode::OkuriMarker, Some(1)),
+            ("OkonaU", ConversionMode::OkuriMarker, Some(5)),
+            ("KaNji", ConversionMode::OkuriMarker, Some(2)),
+            ("KanJi", ConversionMode::OkuriMarker, Some(3)),
+        ] {
+            let req = analyze_input(typed);
+            assert_eq!(req.mode, mode, "typed={:?}", typed);
+            assert_eq!(req.okuri_position, position, "typed={:?}", typed);
+        }
+        // `kk` has settled nothing before the second `K` is fed.
+        let req = analyze_input("KKa");
+        assert_eq!(req.mode, ConversionMode::KanjiConvert);
+        assert_eq!(req.okuri_position, None);
     }
 }
