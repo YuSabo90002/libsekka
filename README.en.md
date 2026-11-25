@@ -38,7 +38,7 @@ reach the intended word.
 
 - Immutable master dictionary format: a single read-only file, mmapped, sorted by key and
   binary-searched, with a romaji prefix index and a SymSpell delete-variant index bundled in
-  (`FORMAT_VERSION = 2`). The whole of SKK-JISYO.L is 175,789 keys / about 21.7 MB.
+  (`FORMAT_VERSION = 2`). The whole of SKK-JISYO.L is 175,789 keys / about 36.6 MB.
 - User dictionary: backed by sled. It records a dictionary-wide sequence number for the most
   recently selected candidate and puts the most recently selected word first within each
   stage (exact matches, then fuzzy matches) — MRU. Word registration uses the same record.
@@ -46,6 +46,8 @@ reach the intended word.
   sekka-server).
 
 ## Building
+
+Run these from the root of the libsekka repository (checkout):
 
 ```sh
 cargo build --release
@@ -62,7 +64,8 @@ cargo cinstall --release --prefix=/usr --libdir=lib
 ## Generating a dictionary
 
 `sekka-dict-tool` converts the SKK dictionary format into the immutable master dictionary
-format. The input encoding is auto-detected (UTF-8, then EUC-JP).
+format. The input encoding is auto-detected (UTF-8, then EUC-JP). Run these from the root of
+the libsekka repository (checkout):
 
 ```sh
 cargo build --release --bin sekka-dict-tool

@@ -34,11 +34,13 @@ fcitx5 用のアドオンは [fcitx5-sekka](https://github.com/YuSabo90002/fcitx
 
 - 不変マスター辞書フォーマット: 単一ファイル・読み取り専用 mmap・キー順ソート＋二分探索。
   ローマ字プレフィックス索引と SymSpell 削除バリアント索引を同梱する（`FORMAT_VERSION = 2`）。
-  SKK-JISYO.L 全体で 175,789 キー / 約 21.7 MB。
+  SKK-JISYO.L 全体で 175,789 キー / 約 36.6 MB。
 - ユーザー辞書: sled バックエンド。確定した候補に「最後に選んだ」通し番号を記録し、次の変換で各段（完全一致／あいまい一致）の中で最後に選んだ語を先頭に並べる（MRU）。単語登録も同じ記録を使う。
 - 変換処理中に外部サーバーへ通信しない（本家の sekka-server 相当の機能は持たない）。
 
 ## ビルド
+
+libsekka のリポジトリ（チェックアウト）の根で次を打つ。
 
 ```sh
 cargo build --release
@@ -56,6 +58,7 @@ cargo cinstall --release --prefix=/usr --libdir=lib
 
 `sekka-dict-tool` が SKK 辞書形式から不変マスター辞書フォーマットへ変換する。
 入力のエンコーディングは自動判別（UTF-8 → EUC-JP）。
+libsekka のリポジトリ（チェックアウト）の根で次を打つ。
 
 ```sh
 cargo build --release --bin sekka-dict-tool
