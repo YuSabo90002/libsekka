@@ -1313,7 +1313,19 @@ impl SekkaContext {
         // branch has nothing to register (there is no staged word), so it is dropped.
         let (candidates, reading) = self.build_candidate_list();
         self.candidates = candidates;
+        self.stage_built_candidates(held_slash, reading);
 
+        true
+    }
+
+    /// Stages the candidate list that `convert_and_stage` just built (its second half)
+    ///
+    /// Takes the romaji buffer, puts a held `/` back into the raw romaji (D-222) and
+    /// then either commits the raw romaji (empty candidate list) or places the first
+    /// candidate in the preedit with `last_commit` cached. Split out of
+    /// `convert_and_stage` only so that the defensive empty-candidates branch can be
+    /// exercised by a unit test; the behaviour is unchanged.
+    fn stage_built_candidates(&mut self, held_slash: bool, reading: String) {
         // Candidate building has finished reading the romaji buffer, so empty it right
         // here (before setting last_commit). That way the invariant "if last_commit is
         // Some then romaji_buffer is empty" (RESEARCH.md Pitfall 2) holds from the moment
@@ -1357,8 +1369,6 @@ impl SekkaContext {
         self.candidates.clear();
         self.candidate_index = -1;
         self.state = ConversionState::Input;
-
-        true
     }
 
     /// Enters reselection mode from the commit display state (Ctrl-J with an empty buffer
@@ -2256,6 +2266,26 @@ mod tests {
             None,
             "innermost step has no window"
         );
+    }
+
+    #[test]
+    fn empty_candidates_branch_keeps_the_held_slash_in_committed_output() {
+        // ac0d4a6 / D-222 / SLASH-05: when the candidate list comes out empty (the
+        // defensive branch D-05 normally prevents), the held `/` that
+        // `convert_and_stage` dropped before building candidates is put back and
+        // committed together with the raw romaji; nothing is staged.
+        let mut ctx = SekkaContext::new();
+        ctx.romaji_buffer = "kanji".to_string();
+        ctx.state = ConversionState::Converting;
+        ctx.candidates.clear();
+        ctx.stage_built_candidates(true, String::new());
+
+        assert_eq!(ctx.poll_output(), Some("/kanji".to_string()));
+        assert!(ctx.last_commit.is_none(), "no reselection is available");
+        assert_eq!(ctx.preedit, "");
+        assert!(ctx.romaji_buffer.is_empty());
+        assert_eq!(ctx.candidate_index, -1);
+        assert_eq!(ctx.state, ConversionState::Input);
     }
 
     #[test]
