@@ -19,7 +19,7 @@ use std::slice;
 use std::sync::Arc;
 use std::time::Instant;
 
-use crate::context::{ConversionState, SekkaContext};
+use crate::context::{ConversionState, RegistrationCursorMove, SekkaContext};
 use crate::dictionary::immutable_dict::ImmutableFileDict;
 use crate::dictionary::user_dict::UserDict;
 use crate::dictionary::{DictError, Dictionary};
@@ -432,7 +432,9 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
 /// letter not in the D-09 table, Ctrl-R with nothing staged, and every
 /// Alt/Super-modified key - the keys that, outside registration, `dispatch_input`
 /// or `handle_selecting_key`'s own miss-and-fall-through would ultimately
-/// commit and forward. `false` for every key `handle_registration_key`
+/// commit and forward (the unmodified arrow keys, Home, End and Delete never
+/// get here while registering: `handle_registration_key` handles them as
+/// cursor keys first). `false` for every key `handle_registration_key`
 /// should still route to the inner step: BackSpace and printable ASCII
 /// (handled by their own dedicated branches below, D-158/D-175), the D-09
 /// table while `active` is in the Selecting state (so the candidate window
@@ -464,6 +466,21 @@ fn would_forward_outside_registration(active: &SekkaContext, keysym: u32, modifi
     true
 }
 
+/// The cursor key a keysym stands for inside the word being assembled during
+/// registration: Left/Right/Home/End and their keypad twins (KP_Left,
+/// KP_Right, KP_Home, KP_End) move the cursor, Delete/KP_Delete deletes the
+/// character after it (`None`). Any other keysym is not a cursor key.
+fn registration_cursor_key(keysym: u32) -> Option<Option<RegistrationCursorMove>> {
+    match keysym {
+        0xFF51 | 0xFF96 => Some(Some(RegistrationCursorMove::Left)),
+        0xFF53 | 0xFF98 => Some(Some(RegistrationCursorMove::Right)),
+        0xFF50 | 0xFF95 => Some(Some(RegistrationCursorMove::Home)),
+        0xFF57 | 0xFF9C => Some(Some(RegistrationCursorMove::End)),
+        0xFFFF | 0xFF9F => Some(None),
+        _ => None,
+    }
+}
+
 /// Dispatches a key event while registering (D-172/D-173/D-174/D-175/D-176/
 /// D-177/D-178/REG-02, Phase 10)
 ///
@@ -485,25 +502,35 @@ fn would_forward_outside_registration(active: &SekkaContext, keysym: u32, modifi
 ///    an ordinary key (closes the candidate window and/or reverts to the
 ///    original romaji, D-160/D-161, when there is something for it to act
 ///    on); when that leaves it unconsumed (the innermost step had nothing to
-///    delete), the last character of the word being assembled is deleted
-///    instead (`pop_registration_draft`, D-175) - and when the word is empty
-///    too, this is simply a no-op (the reading is never touched and nothing
-///    is forwarded).
-/// 4. A key that `would_forward_outside_registration` says would reach the
+///    delete), the character before the cursor in the word being assembled
+///    is deleted instead (`pop_registration_draft`, D-175) - and when the
+///    cursor is at the start of the word (or the word is empty), this is
+///    simply a no-op (the reading is never touched and nothing is
+///    forwarded).
+/// 4. Left/Right/Home/End/Delete with no Ctrl/Alt/Super (and their keypad
+///    twins, the same way KP_Enter accompanies Enter) move the cursor inside
+///    the innermost step's word or delete the character after it
+///    (`move_registration_cursor`/`delete_registration_draft_forward`). They
+///    act only while the innermost step's own inner context shows nothing;
+///    while romaji is being typed, a candidate is staged or the candidate
+///    window is open they are consumed and change nothing (nothing is
+///    confirmed). Never forwarded.
+/// 5. A key that `would_forward_outside_registration` says would reach the
 ///    application outside registration is consumed and changes nothing at
 ///    all (D-177) - not even routed to the inner step, so the candidate that
 ///    may be staged there (commit display or the candidate window) is left
 ///    exactly as it was.
-/// 5. Everything else is routed to the inner step's context via `route_key`,
+/// 6. Everything else is routed to the inner step's context via `route_key`,
 ///    exactly like an ordinary key event. When that leaves it unconsumed and
 ///    the key is a printable ASCII character with no modifier, it is
-///    appended to the word instead (`push_registration_draft`, D-177/D-158) -
+///    inserted into the word at the cursor instead
+///    (`push_registration_draft`, D-177/D-158) -
 ///    even when the innermost step's own buffer is empty, matching what
 ///    `commit_with_trailing_char` does outside registration.
 ///
-/// In branches 3 and 5, `route_key`'s own forward-key output parameter is
+/// In branches 3 and 6, `route_key`'s own forward-key output parameter is
 /// always discarded after asserting it stayed `false`: nothing typed while
-/// registering is ever forwarded to the application (REG-02), and branch 4
+/// registering is ever forwarded to the application (REG-02), and branch 5
 /// already stops every key that would have set it before `route_key` is ever
 /// called, so it can never actually become `true` here.
 fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) {
@@ -543,14 +570,30 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
         return;
     }
 
-    // 4. Keys that would reach the application outside registration (D-177):
+    // 4. Cursor keys inside the word being assembled.
+    if !ctrl && !other {
+        if let Some(action) = registration_cursor_key(keysym) {
+            match action {
+                Some(motion) => {
+                    ctx.move_registration_cursor(motion);
+                }
+                None => {
+                    ctx.delete_registration_draft_forward();
+                }
+            }
+            ctx.absorb_registration_output();
+            return;
+        }
+    }
+
+    // 5. Keys that would reach the application outside registration (D-177):
     // consumed without touching the inner step at all.
     if would_forward_outside_registration(ctx.active(), keysym, modifiers) {
         ctx.absorb_registration_output();
         return;
     }
 
-    // 5. Everything else -> the inner step; a printable-ASCII miss appends
+    // 6. Everything else -> the inner step; a printable-ASCII miss appends
     // to the word instead (D-177/D-158).
     let mut discarded_forward = false;
     let consumed = route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
@@ -811,8 +854,11 @@ pub unsafe extern "C" fn sekka_context_get_preedit(ctx: *mut SekkaContextFfi) ->
 
 /// Gets the cursor position within the preedit
 ///
-/// Returns the cursor position in bytes. While registering, this is the byte
-/// length of `registration_word()` (see `sekka_context_get_preedit`).
+/// Returns the cursor position in bytes within the string
+/// `sekka_context_get_preedit` returns. While registering, this is the
+/// display cursor inside `registration_word()`: the UTF-8 byte offset right
+/// after the part of the word before the cursor and the inner step's own
+/// preedit (`SekkaContext::registration_cursor_byte_pos`).
 /// Returns 0 for a NULL pointer or on panic.
 ///
 /// # Safety
@@ -824,8 +870,8 @@ pub unsafe extern "C" fn sekka_context_get_preedit_cursor_pos(ctx: *mut SekkaCon
     }
     catch_unwind(std::panic::AssertUnwindSafe(|| {
         let ctx = unsafe { &mut *ctx };
-        match ctx.ctx.registration_word() {
-            Some(word) => word.len() as c_int,
+        match ctx.ctx.registration_cursor_byte_pos() {
+            Some(pos) => pos as c_int,
             None => ctx.ctx.get_preedit().len() as c_int,
         }
     }))
@@ -5153,6 +5199,126 @@ mod tests {
             assert_eq!(sekka_context_is_registering(ctx), 1);
             assert!(sekka_context_poll_output(ctx).is_null());
             assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// Registration cursor (M004): the cursor keys move the cursor inside
+    /// the word being assembled, typing and conversion results go in at the
+    /// cursor, Delete removes the character after it, and
+    /// `sekka_context_get_preedit_cursor_pos` reports the display cursor as
+    /// a UTF-8 byte offset (multi-byte characters included).
+    #[test]
+    fn registration_cursor_keys_move_insert_and_report_byte_positions() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            assert_eq!(sekka_context_is_registering(ctx), 1);
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 0);
+
+            for ch in "Nihon".chars() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            sekka_context_trigger(ctx);
+            sekka_context_process_key_event(ctx, b'+' as u32, 0, 0);
+            assert_eq!(preedit_string(ctx), "にほん+");
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 10);
+
+            // (keysym, expected word, expected byte cursor)
+            for (keysym, word, pos) in [
+                (0xFF51u32, "にほん+", 9), // Left
+                (0xFF50, "にほん+", 0),    // Home
+                (0xFF50, "にほん+", 0),    // Home again: nothing changes
+                (0xFF51, "にほん+", 0),    // Left at the start
+                (0xFF53, "にほん+", 3),    // Right
+                (0xFFFF, "にん+", 3),      // Delete removes ほ
+                (0xFF98, "にん+", 6),      // KP_Right
+                (0xFF96, "にん+", 3),      // KP_Left
+                (0xFF9F, "に+", 3),        // KP_Delete removes ん
+                (0xFF57, "に+", 4),        // End
+                (0xFF57, "に+", 4),        // End again
+                (0xFF53, "に+", 4),        // Right at the end
+                (0xFFFF, "に+", 4),        // Delete at the end
+                (0xFF95, "に+", 0),        // KP_Home
+                (0xFF9C, "に+", 4),        // KP_End
+                (0xFF51, "に+", 3),        // Left
+            ] {
+                let consumed = sekka_context_process_key_event(ctx, keysym, 0, 0);
+                assert_eq!(consumed, 1, "keysym={:#x}", keysym);
+                assert_eq!(preedit_string(ctx), word, "keysym={:#x}", keysym);
+                assert_eq!(
+                    sekka_context_get_preedit_cursor_pos(ctx),
+                    pos,
+                    "keysym={:#x}",
+                    keysym
+                );
+                assert!(sekka_context_poll_output(ctx).is_null());
+                assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            }
+
+            // Romaji being typed shows at the cursor, with the display cursor
+            // right after it.
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            assert_eq!(preedit_string(ctx), "にKa+");
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 5);
+
+            // While romaji is being typed the cursor keys change nothing.
+            for keysym in [0xFF51u32, 0xFF53, 0xFF50, 0xFF57, 0xFFFF] {
+                assert_eq!(sekka_context_process_key_event(ctx, keysym, 0, 0), 1);
+                assert_eq!(preedit_string(ctx), "にKa+", "keysym={:#x}", keysym);
+                assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 5);
+                assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            }
+
+            sekka_context_trigger(ctx);
+            assert_eq!(preedit_string(ctx), "にか+");
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 6);
+
+            // A printable key flushes the staged candidate at the cursor and
+            // goes in right after it.
+            sekka_context_process_key_event(ctx, b'#' as u32, 0, 0);
+            assert_eq!(preedit_string(ctx), "にか#+");
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 7);
+
+            // BackSpace deletes the character before the cursor.
+            sekka_context_process_key_event(ctx, 0xFF08, 0, 0);
+            assert_eq!(preedit_string(ctx), "にか+");
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 6);
+
+            let finished = sekka_context_process_key_event(ctx, 0xFF0D, 0, 0);
+            assert_eq!(finished, 1);
+            let output = sekka_context_poll_output(ctx);
+            assert!(!output.is_null());
+            assert_eq!(CStr::from_ptr(output).to_str().unwrap(), "にか+");
+            sekka_free_string(output);
+            assert_eq!(sekka_context_is_registering(ctx), 0);
+
+            sekka_context_free(ctx);
+        }
+    }
+
+    /// Registration cursor (M004): with Ctrl/Alt/Super held, the cursor keys
+    /// keep D-177's "consumed, change nothing" behaviour.
+    #[test]
+    fn modified_cursor_keys_during_registration_change_nothing() {
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+            sekka_context_process_key_event(ctx, b'+' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'+' as u32, 0, 0);
+            assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 2);
+
+            for modifiers in [MOD_CTRL, MOD_ALT, MOD_SUPER] {
+                for keysym in [0xFF51u32, 0xFF50, 0xFFFF] {
+                    let consumed = sekka_context_process_key_event(ctx, keysym, modifiers, 0);
+                    assert_eq!(consumed, 1);
+                    assert_eq!(preedit_string(ctx), "++");
+                    assert_eq!(sekka_context_get_preedit_cursor_pos(ctx), 2);
+                    assert_eq!(sekka_context_take_forward_key(ctx), 0);
+                }
+            }
 
             sekka_context_free(ctx);
         }

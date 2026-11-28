@@ -356,9 +356,57 @@ struct RegistrationSession {
     /// absorbed into `draft` by `absorb_registration_output`, REG-02).
     inner: SekkaContext,
     /// The word being assembled, standing in for "the application" while
-    /// registering (D-175). Whatever `inner` commits is appended to the end
-    /// of this string.
+    /// registering (D-175). Whatever `inner` commits is inserted at `cursor`.
     draft: String,
+    /// This step's own cursor inside `draft`, counted in Unicode code points
+    /// (`char`s), always in `0..=draft.chars().count()`. Starts at 0 when the
+    /// step begins; every insertion moves it past the inserted text. Each
+    /// nested step keeps its own cursor.
+    cursor: usize,
+}
+
+impl RegistrationSession {
+    /// Byte offset of `cursor` inside `draft`
+    fn cursor_byte(&self) -> usize {
+        self.draft
+            .char_indices()
+            .nth(self.cursor)
+            .map_or(self.draft.len(), |(index, _)| index)
+    }
+
+    /// Inserts `text` at the cursor and moves the cursor past it
+    fn insert_at_cursor(&mut self, text: &str) {
+        let at = self.cursor_byte();
+        self.draft.insert_str(at, text);
+        self.cursor += text.chars().count();
+    }
+
+    /// Whether this step's `inner` shows nothing of its own: no romaji being
+    /// typed, no staged candidate and no candidate window. Cursor movement
+    /// and forward deletion act on `draft` only in this case (they never
+    /// confirm or change what `inner` is showing).
+    fn inner_is_idle(&self) -> bool {
+        let inner = &self.inner;
+        inner.state == ConversionState::Input
+            && inner.romaji_buffer.is_empty()
+            && inner.preedit.is_empty()
+            && inner.last_commit.is_none()
+            && inner.candidates.is_empty()
+    }
+}
+
+/// A cursor movement inside the word being assembled during word
+/// registration (`SekkaContext::move_registration_cursor`)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RegistrationCursorMove {
+    /// One character towards the start of the word (Left)
+    Left,
+    /// One character towards the end of the word (Right)
+    Right,
+    /// To the start of the word (Home)
+    Home,
+    /// To the end of the word (End)
+    End,
 }
 
 impl Default for SekkaContext {
@@ -716,6 +764,7 @@ impl SekkaContext {
             reading: last.reading.clone(),
             inner,
             draft: String::new(),
+            cursor: 0,
         }));
         true
     }
@@ -759,7 +808,8 @@ impl SekkaContext {
     /// first, D-171). When this step *is* the innermost: confirms whatever
     /// `inner` currently shows (the selected candidate during reselection,
     /// D-172), commits it (or the raw romaji as-is when nothing was staged,
-    /// D-176), appends whatever came out to `draft`. An empty `draft` after
+    /// D-176), inserts whatever came out into `draft` at the cursor (exactly
+    /// where it was shown). An empty `draft` after
     /// that (REG-05 - nothing was ever typed) leaves the session in place and
     /// returns false, so an empty Enter does not silently exit registration.
     /// Otherwise this step is consumed: the reading/word pair is recorded
@@ -792,7 +842,7 @@ impl SekkaContext {
         session.inner.confirm();
         session.inner.commit_raw_romaji();
         if let Some(text) = session.inner.poll_output() {
-            session.draft.push_str(&text);
+            session.insert_at_cursor(&text);
         }
 
         if session.draft.is_empty() {
@@ -897,7 +947,8 @@ impl SekkaContext {
     /// Called once per key event by capi, after routing the key to
     /// `active_mut()`. Walks from the outermost registration step down: each
     /// step first lets its own (possibly still-registering) `inner` absorb
-    /// its own output, then polls `inner.poll_output()` into its own `draft`.
+    /// its own output, then polls `inner.poll_output()` into its own `draft`
+    /// at that step's own cursor (moving the cursor past it).
     /// This is what keeps an inner step's commits from ever reaching the
     /// application directly (REG-02) - and, once an inner step finishes via
     /// `finish_registration`, what carries its now-registered word up into
@@ -906,26 +957,27 @@ impl SekkaContext {
         if let Some(session) = self.registration.as_mut() {
             session.inner.absorb_registration_output();
             if let Some(text) = session.inner.poll_output() {
-                session.draft.push_str(&text);
+                session.insert_at_cursor(&text);
             }
         }
     }
 
-    /// Deletes the last character of the innermost registration step's word
-    /// (D-175)
+    /// Deletes the character before the cursor in the innermost registration
+    /// step's word (D-175)
     ///
     /// The word being assembled stands in for the application: a BackSpace
     /// that the empty inner step did not consume (`route_key` on
-    /// `active_mut()` returned 0) deletes its last character instead. It is
+    /// `active_mut()` returned 0) deletes the character before the cursor
+    /// instead, and the cursor moves back by one. At the start of the word
+    /// this does nothing. It is
     /// a plain string that keeps no per-word original romaji - unlike
     /// `SekkaContext::backspace`, there is nothing to revert to, only a
     /// character to drop. Recurses to the innermost step exactly like
     /// `active`/`active_mut` (D-171).
     ///
     /// # Returns
-    /// true when a character was popped from the innermost step's `draft`,
-    /// false when not registering or the innermost step's `draft` was
-    /// already empty
+    /// true when a character was deleted from the innermost step's `draft`,
+    /// false when not registering or the cursor was already at the start
     pub fn pop_registration_draft(&mut self) -> bool {
         let Some(session) = self.registration.as_mut() else {
             return false;
@@ -933,22 +985,90 @@ impl SekkaContext {
         if session.inner.is_registering() {
             return session.inner.pop_registration_draft();
         }
-        session.draft.pop().is_some()
+        if session.cursor == 0 {
+            return false;
+        }
+        session.cursor -= 1;
+        let at = session.cursor_byte();
+        session.draft.remove(at);
+        true
     }
 
-    /// Appends a character to the innermost registration step's word (D-177)
+    /// Deletes the character after the cursor in the innermost registration
+    /// step's word (Delete)
+    ///
+    /// Acts only while the innermost step's own `inner` shows nothing (no
+    /// romaji being typed, no staged candidate, no candidate window);
+    /// otherwise nothing changes and nothing is confirmed. At the end of the
+    /// word this does nothing. The cursor does not move.
+    ///
+    /// # Returns
+    /// true when a character was deleted, false otherwise (not registering,
+    /// the inner step is busy, or the cursor was at the end)
+    pub fn delete_registration_draft_forward(&mut self) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+        if session.inner.is_registering() {
+            return session.inner.delete_registration_draft_forward();
+        }
+        if !session.inner_is_idle() {
+            return false;
+        }
+        let at = session.cursor_byte();
+        if at == session.draft.len() {
+            return false;
+        }
+        session.draft.remove(at);
+        true
+    }
+
+    /// Moves the cursor inside the innermost registration step's word
+    /// (Left/Right/Home/End)
+    ///
+    /// Acts only while the innermost step's own `inner` shows nothing (no
+    /// romaji being typed, no staged candidate, no candidate window);
+    /// otherwise nothing changes and nothing is confirmed. Left at the start,
+    /// Right at the end, and Home/End when already there change nothing.
+    ///
+    /// # Returns
+    /// true when the cursor moved, false otherwise
+    pub fn move_registration_cursor(&mut self, motion: RegistrationCursorMove) -> bool {
+        let Some(session) = self.registration.as_mut() else {
+            return false;
+        };
+        if session.inner.is_registering() {
+            return session.inner.move_registration_cursor(motion);
+        }
+        if !session.inner_is_idle() {
+            return false;
+        }
+        let len = session.draft.chars().count();
+        let target = match motion {
+            RegistrationCursorMove::Left => session.cursor.saturating_sub(1),
+            RegistrationCursorMove::Right => (session.cursor + 1).min(len),
+            RegistrationCursorMove::Home => 0,
+            RegistrationCursorMove::End => len,
+        };
+        let moved = target != session.cursor;
+        session.cursor = target;
+        moved
+    }
+
+    /// Inserts a character into the innermost registration step's word at
+    /// its cursor (D-177)
     ///
     /// A printable key that would reach the application outside
     /// registration (the inner step had nothing to commit it with, so
-    /// `route_key` on `active_mut()` returned 0) goes to the end of the word
-    /// instead - even when the innermost step's own buffer is empty (the
+    /// `route_key` on `active_mut()` returned 0) goes into the word at the
+    /// cursor instead, and the cursor moves past it - even when the innermost step's own buffer is empty (the
     /// registration-mode counterpart of `commit_with_trailing_char`'s D-158,
     /// but always appending since there is no per-key commit to attach to
     /// here). Recurses to the innermost step exactly like `active`/
     /// `active_mut` (D-171).
     ///
     /// # Returns
-    /// true when `ch` was appended to the innermost step's `draft`, false
+    /// true when `ch` was inserted into the innermost step's `draft`, false
     /// when not registering
     pub fn push_registration_draft(&mut self, ch: char) -> bool {
         let Some(session) = self.registration.as_mut() else {
@@ -957,7 +1077,8 @@ impl SekkaContext {
         if session.inner.is_registering() {
             return session.inner.push_registration_draft(ch);
         }
-        session.draft.push(ch);
+        let mut buf = [0u8; 4];
+        session.insert_at_cursor(ch.encode_utf8(&mut buf));
         true
     }
 
@@ -992,16 +1113,38 @@ impl SekkaContext {
     }
 
     /// The word being assembled in the innermost registration step (D-171):
-    /// the innermost step's `draft` plus its `inner`'s current preedit (the
-    /// candidate on screen, or the romaji buffer while typing). An outer
-    /// step's own in-progress word is deliberately not shown - only the
-    /// innermost step's is (D-171). `None` outside registration.
+    /// the innermost step's `draft` before its cursor, then its `inner`'s
+    /// current preedit (the candidate on screen, or the romaji buffer while
+    /// typing), then the rest of `draft` after the cursor. An outer step's
+    /// own in-progress word is deliberately not shown - only the innermost
+    /// step's is (D-171). `None` outside registration.
     pub fn registration_word(&self) -> Option<String> {
+        let current = self.innermost_registration()?;
+        let (before, after) = current.draft.split_at(current.cursor_byte());
+        Some(format!(
+            "{}{}{}",
+            before,
+            current.inner.get_preedit(),
+            after
+        ))
+    }
+
+    /// The display cursor inside `registration_word()`, as a UTF-8 byte
+    /// offset: right after the part of the innermost step's `draft` before
+    /// its cursor and its `inner`'s current preedit. `None` outside
+    /// registration.
+    pub fn registration_cursor_byte_pos(&self) -> Option<usize> {
+        let current = self.innermost_registration()?;
+        Some(current.cursor_byte() + current.inner.get_preedit().len())
+    }
+
+    /// The innermost registration step, `None` outside registration
+    fn innermost_registration(&self) -> Option<&RegistrationSession> {
         let mut current = self.registration.as_ref()?;
         while let Some(inner_session) = current.inner.registration.as_ref() {
             current = inner_session;
         }
-        Some(format!("{}{}", current.draft, current.inner.get_preedit()))
+        Some(current)
     }
 
     // === Real-time guide (GUIDE-01 to GUIDE-04, Phase 16) ===
@@ -6430,5 +6573,218 @@ mod tests {
             pos("鍵") < pos("角"),
             "鍵 selected last now comes before 角: {displays:?}"
         );
+    }
+
+    // === Registration cursor (M004) ===
+
+    /// Helper: a context in registration (one step) for the reading か,
+    /// without any dictionary.
+    fn registering_context() -> SekkaContext {
+        let mut ctx = SekkaContext::new();
+        for ch in "Ka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+        ctx
+    }
+
+    /// The cursor moves by code point over a word mixing kanji, kana, a
+    /// full-width symbol and an emoji; insertion goes in at the cursor and
+    /// BackSpace/Delete remove the character before/after it. The display
+    /// cursor is reported as a UTF-8 byte offset.
+    #[test]
+    fn registration_cursor_moves_by_code_point_over_multibyte_text() {
+        let mut ctx = registering_context();
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(0));
+        for ch in "日本語＃😀".chars() {
+            assert!(ctx.push_registration_draft(ch));
+        }
+        assert_eq!(ctx.registration_word(), Some("日本語＃😀".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(16));
+
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Left));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(12));
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Left));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(9));
+
+        for ch in "かな".chars() {
+            assert!(ctx.push_registration_draft(ch));
+        }
+        assert_eq!(ctx.registration_word(), Some("日本語かな＃😀".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(15));
+
+        assert!(ctx.pop_registration_draft());
+        assert_eq!(ctx.registration_word(), Some("日本語か＃😀".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(12));
+
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Right));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(15));
+        assert!(ctx.delete_registration_draft_forward());
+        assert_eq!(ctx.registration_word(), Some("日本語か＃".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(15));
+
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Home));
+        assert!(ctx.delete_registration_draft_forward());
+        assert_eq!(ctx.registration_word(), Some("本語か＃".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(0));
+    }
+
+    /// E1/E2/E6: Left and BackSpace at the start, Right and Delete at the
+    /// end, any of them on an empty word, and repeated Home/End change
+    /// nothing.
+    #[test]
+    fn registration_cursor_boundaries_change_nothing() {
+        let mut ctx = registering_context();
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Left));
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Right));
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Home));
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::End));
+        assert!(!ctx.delete_registration_draft_forward());
+        assert!(!ctx.pop_registration_draft());
+        assert_eq!(ctx.registration_word(), Some(String::new()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(0));
+
+        for ch in "石火".chars() {
+            ctx.push_registration_draft(ch);
+        }
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Right));
+        assert!(!ctx.delete_registration_draft_forward());
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::End));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(6));
+
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Home));
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Home));
+        assert!(!ctx.move_registration_cursor(RegistrationCursorMove::Left));
+        assert!(!ctx.pop_registration_draft());
+        assert_eq!(ctx.registration_word(), Some("石火".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(0));
+    }
+
+    /// SC2/N2: while the innermost step has romaji being typed, a staged
+    /// candidate or an open candidate window, cursor movement and Delete
+    /// change nothing and confirm nothing.
+    #[test]
+    fn registration_cursor_does_nothing_while_the_inner_step_is_busy() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せき", "石");
+        dict.add_entry("せき", "席");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(dict));
+        for ch in "Seki".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+        for ch in "+-".chars() {
+            ctx.push_registration_draft(ch);
+        }
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Left));
+
+        let all_moves = |ctx: &mut SekkaContext| {
+            for motion in [
+                RegistrationCursorMove::Left,
+                RegistrationCursorMove::Right,
+                RegistrationCursorMove::Home,
+                RegistrationCursorMove::End,
+            ] {
+                assert!(!ctx.move_registration_cursor(motion), "{motion:?}");
+            }
+            assert!(!ctx.delete_registration_draft_forward());
+        };
+
+        // Romaji being typed.
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        let word = ctx.registration_word();
+        let pos = ctx.registration_cursor_byte_pos();
+        all_moves(&mut ctx);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), word);
+        assert_eq!(ctx.registration_cursor_byte_pos(), pos);
+
+        // A staged candidate.
+        ctx.active_mut().process_key('\0', true);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("+石-".to_string()));
+        let pos = ctx.registration_cursor_byte_pos();
+        all_moves(&mut ctx);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("+石-".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), pos);
+        assert!(ctx.active().has_staged_candidate());
+
+        // The candidate window.
+        ctx.active_mut().process_key('\0', true);
+        assert_eq!(ctx.active().state(), ConversionState::Selecting);
+        let index = ctx.active().get_candidate_index();
+        all_moves(&mut ctx);
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.active().state(), ConversionState::Selecting);
+        assert_eq!(ctx.active().get_candidate_index(), index);
+        assert_eq!(ctx.registration_word(), Some("+石-".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), pos);
+    }
+
+    /// SC3/E4/E5: in a nested registration each step keeps its own cursor;
+    /// the inner step's registered word goes into the outer word at the
+    /// outer cursor and the outer cursor moves past it; Enter then registers
+    /// exactly the word on screen.
+    #[test]
+    fn nested_registration_inserts_the_inner_word_at_the_outer_cursor() {
+        let mut dict = MockDictionary::new();
+        dict.add_entry("せっか", "赤化");
+        dict.add_entry("せき", "石");
+        dict.add_entry("か", "火");
+        dict.add_entry("いし", "石");
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![Arc::new(dict), user_dict.clone()]);
+
+        for ch in "Sekka".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert!(ctx.begin_registration());
+
+        // Outer word: 火, cursor moved to its start.
+        for ch in "Ka".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        assert!(ctx.active_mut().flush_last_commit());
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.registration_word(), Some("火".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(3));
+        assert!(ctx.move_registration_cursor(RegistrationCursorMove::Home));
+
+        // Nested step for せき, with its own cursor starting at 0.
+        for ch in "Seki".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        assert!(ctx.active_mut().begin_registration());
+        assert_eq!(ctx.registration_word(), Some(String::new()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(0));
+        for ch in "Ishi".chars() {
+            ctx.active_mut().process_key(ch, false);
+        }
+        ctx.active_mut().process_key('\0', true);
+        assert!(ctx.finish_registration());
+        ctx.absorb_registration_output();
+
+        assert_eq!(ctx.registration_word(), Some("石火".to_string()));
+        assert_eq!(ctx.registration_cursor_byte_pos(), Some(3));
+
+        assert!(ctx.finish_registration());
+        ctx.absorb_registration_output();
+        assert_eq!(ctx.poll_output(), Some("石火".to_string()));
+        let entries = user_dict.lookup("せっか").expect("lookup failed");
+        assert_eq!(entries[0].word, "石火", "{:?}", entries);
     }
 }
