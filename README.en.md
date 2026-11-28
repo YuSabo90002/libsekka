@@ -34,6 +34,23 @@ Candidate search has four stages, following upstream:
 That is what lets a typo like `Nihogno` or a Kunrei-shiki spelling like `Konnitiha` still
 reach the intended word.
 
+Prefixes and suffixes are looked up under readings marked with `>`, as in SKK dictionaries. A
+`>` is kept as part of the romaji and is read as the marker only when you convert. Converting
+`cho>` looks up the reading ちょう> (超), and converting `>teki` typed right after a converted
+word looks up the reading >てき (的) (`nihon` → 日本, then `>teki` → 日本的; the prefix or
+suffix and the word next to it are separate conversions). Typing the `>` commits the word that
+is displayed. Without a conversion, an input containing `>` is committed as the same characters
+(`a>b` → a>b). Readings containing `>` are looked up by exact match and the generated
+candidates (hiragana, katakana, romaji) only, without fuzzy search. Conversely, an ordinary
+conversion without `>` never offers words that exist only under prefix or suffix readings.
+Suffixes with okurigana are not supported.
+
+During word registration, the word being registered has a cursor. ← and → move it one
+character at a time and Home and End to the start and the end (including the same keys on the
+keypad), and input and conversion results are inserted at the cursor. BackSpace deletes the
+character before the cursor and Delete the character after it. While romaji is half-typed or
+a conversion is in progress, these keys do nothing.
+
 ## Structure
 
 - Immutable master dictionary format: a single read-only file, mmapped, sorted by key and
