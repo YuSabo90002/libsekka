@@ -36,8 +36,8 @@ reach the intended word.
 
 Prefixes and suffixes are looked up under readings marked with `>`, as in SKK dictionaries. A
 `>` is kept as part of the romaji and is read as the marker only when you convert. Converting
-`cho>` looks up the reading ちょう> (超), and converting `>teki` typed right after a converted
-word looks up the reading >てき (的) (`nihon` → 日本, then `>teki` → 日本的; the prefix or
+`chou>` looks up the reading ちょう> (超), and converting `>teki` typed right after a converted
+word looks up the reading >てき (的) (`Nihon` → 日本, then `>teki` → 日本的; the prefix or
 suffix and the word next to it are separate conversions). Typing the `>` commits the word that
 is displayed. Without a conversion, an input containing `>` is committed as the same characters
 (`a>b` → a>b). Readings containing `>` are looked up by exact match and the generated

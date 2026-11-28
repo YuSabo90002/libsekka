@@ -53,6 +53,10 @@ fn is_modifier_keysym(keysym: u32) -> bool {
         || keysym == 0xFF7F
 }
 
+/// The keysym of the prefix/suffix marker `>` (M005; X11 keysym `greater`, equal to
+/// its ASCII code point like every printable ASCII keysym)
+const AFFIX_MARKER_KEYSYM: u32 = 0x3E;
+
 /// Decides whether a key is a character key to accumulate in the romaji buffer
 /// (D-03/D-20/D-21)
 ///
@@ -295,11 +299,23 @@ fn is_selecting_table_key(keysym: u32, modifiers: u32) -> bool {
 /// Ctrl-J later drops that one `/` and converts only what follows it. With an empty
 /// buffer `/` stays on the D-158 path, and with Alt (D-185) or Ctrl/Super
 /// (D-03/D-162) it keeps its existing handling.
+///
+/// M005: when `affix_marker` is true, `>` without Ctrl/Alt/Super is buffered as part
+/// of the romaji (the SKK prefix/suffix marker), wherever it is typed: with an empty
+/// buffer (it is not handed to the application), after romaji, or while a converted
+/// word is staged (the D-12 flush above commits and learns that word first). Ctrl-J
+/// interprets it (`SekkaContext::build_affix_candidates`); any other key commits the
+/// buffer with the `>` as typed, exactly what D-158 used to commit. Judged after the
+/// D-12 flush and the `/` branch, so the slash separator and the other symbols keep
+/// their paths. The full-width `＞` never arrives here as `0x3E` and is not a marker.
+/// `affix_marker` is false only for the inner step of word registration
+/// (`handle_registration_key`), where `>` keeps its D-158/D-177 handling.
 fn dispatch_input(
     ctx: &mut SekkaContext,
     forward_key: &mut bool,
     keysym: u32,
     modifiers: u32,
+    affix_marker: bool,
 ) -> c_int {
     let ctrl = (modifiers & MOD_CTRL) != 0;
     let other = (modifiers & (MOD_ALT | MOD_SUPER)) != 0;
@@ -333,6 +349,14 @@ fn dispatch_input(
     // buffer empty) and a held `/` can never both happen.
     if !ctrl && !other && keysym == 0x2F && ctx.commit_and_hold_slash() {
         debug_assert!(!flushed);
+        return 1;
+    }
+
+    // M005: the prefix/suffix marker `>` (keysym 0x3E; Shift is already applied to
+    // the keysym) is buffered like a romaji character. Placed after the single D-12
+    // flush, so a staged word is committed and learned before the `>` is held.
+    if affix_marker && !ctrl && !other && keysym == AFFIX_MARKER_KEYSYM {
+        ctx.process_key('>', false);
         return 1;
     }
 
@@ -400,7 +424,13 @@ fn dispatch_input(
 /// non-trigger key-routing decision, factored out so `handle_registration_key`
 /// can send a key to the innermost registration step's context the same way
 /// the top-level FFI entry point sends it to the top-level context.
-fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifiers: u32) -> c_int {
+fn route_key(
+    ctx: &mut SekkaContext,
+    forward_key: &mut bool,
+    keysym: u32,
+    modifiers: u32,
+    affix_marker: bool,
+) -> c_int {
     if ctx.state() == ConversionState::Selecting {
         if handle_selecting_key(ctx, keysym, modifiers) {
             return 1;
@@ -413,7 +443,7 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
         // against D-09's table, so it too lands here: the confirmed candidate gets
         // the character appended without Alt (D-185).
         ctx.confirm();
-        let result = dispatch_input(ctx, forward_key, keysym, modifiers);
+        let result = dispatch_input(ctx, forward_key, keysym, modifiers, affix_marker);
         if result == 0 {
             *forward_key = true;
             return 1;
@@ -421,7 +451,7 @@ fn route_key(ctx: &mut SekkaContext, forward_key: &mut bool, keysym: u32, modifi
         return result;
     }
 
-    dispatch_input(ctx, forward_key, keysym, modifiers)
+    dispatch_input(ctx, forward_key, keysym, modifiers, affix_marker)
 }
 
 /// Whether, outside registration, this key would reach `dispatch_input`'s
@@ -550,7 +580,13 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
     if !other && (esc || ctrl_g) {
         if ctx.active().state() == ConversionState::Selecting {
             let mut discarded_forward = false;
-            route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+            route_key(
+                ctx.active_mut(),
+                &mut discarded_forward,
+                keysym,
+                modifiers,
+                false,
+            );
         } else {
             ctx.cancel_registration();
         }
@@ -561,7 +597,13 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
     // 3. BackSpace (D-175).
     if !ctrl && !other && keysym == 0xFF08 {
         let mut discarded_forward = false;
-        let consumed = route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+        let consumed = route_key(
+            ctx.active_mut(),
+            &mut discarded_forward,
+            keysym,
+            modifiers,
+            false,
+        );
         debug_assert!(!discarded_forward);
         if consumed == 0 {
             ctx.pop_registration_draft();
@@ -596,7 +638,13 @@ fn handle_registration_key(ctx: &mut SekkaContext, keysym: u32, modifiers: u32) 
     // 6. Everything else -> the inner step; a printable-ASCII miss appends
     // to the word instead (D-177/D-158).
     let mut discarded_forward = false;
-    let consumed = route_key(ctx.active_mut(), &mut discarded_forward, keysym, modifiers);
+    let consumed = route_key(
+        ctx.active_mut(),
+        &mut discarded_forward,
+        keysym,
+        modifiers,
+        false,
+    );
     debug_assert!(!discarded_forward);
     if consumed == 0 && !ctrl && !other && is_printable_ascii(keysym) {
         ctx.push_registration_draft(keysym as u8 as char);
@@ -791,7 +839,7 @@ pub unsafe extern "C" fn sekka_context_process_key_event(
             return 1;
         }
 
-        route_key(&mut ctx.ctx, &mut ctx.forward_key, keysym, modifiers)
+        route_key(&mut ctx.ctx, &mut ctx.forward_key, keysym, modifiers, true)
     }))
     .unwrap_or(0)
 }
@@ -5797,6 +5845,159 @@ mod tests {
             );
             sekka_free_dictionary(reopened);
 
+            sekka_context_free(ctx);
+        }
+    }
+
+    // === M005: the prefix/suffix marker `>` through the key routing ===
+
+    #[test]
+    fn the_marker_with_an_empty_buffer_is_buffered_and_not_handed_to_the_application() {
+        // E3: `>` on nothing is consumed into the buffer; a following space commits
+        // `> ` exactly as the forwarded `>` plus space used to produce (SC3/N1).
+        unsafe {
+            let ctx = sekka_context_new();
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(preedit_string(ctx), ">");
+            assert_eq!(take_output(ctx), None);
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            assert_eq!(sekka_context_process_key_event(ctx, 0x20, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("> ".to_string()));
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(preedit_string(ctx), "");
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_marker_after_romaji_is_buffered_and_committed_as_typed_without_ctrl_j() {
+        // SC3/N1: `a>b` + space commits `a>b `, the same text D-158 committed before.
+        unsafe {
+            let ctx = sekka_context_new();
+            for keysym in [b'a' as u32, 0x3E, b'b' as u32] {
+                assert_eq!(sekka_context_process_key_event(ctx, keysym, 0, 0), 1);
+                assert_eq!(take_output(ctx), None);
+            }
+            assert_eq!(preedit_string(ctx), "a>b");
+            assert_eq!(sekka_context_process_key_event(ctx, 0x20, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("a>b ".to_string()));
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+
+            // Enter (D-03) still commits the buffer as typed and forwards Enter.
+            sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, 0x3E, 0, 0);
+            assert_eq!(sekka_context_process_key_event(ctx, 0xFF0D, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("k>".to_string()));
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_marker_on_a_staged_word_commits_it_and_starts_a_suffix_reading() {
+        // E4: the D-12 flush commits the staged word at the `>`, and the `>` waits in
+        // the buffer; Ctrl-J then converts the marked reading.
+        unsafe {
+            let ctx = make_commit_display_state();
+            assert_eq!(preedit_string(ctx), "か");
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("か".to_string()));
+            assert_eq!(sekka_context_take_forward_key(ctx), 0);
+            assert_eq!(preedit_string(ctx), ">");
+
+            for ch in "teki".bytes() {
+                sekka_context_process_key_event(ctx, ch as u32, 0, 0);
+            }
+            assert_eq!(preedit_string(ctx), ">teki");
+            assert_eq!(sekka_context_trigger(ctx), 1);
+            // No dictionary: the first generated candidate (hiragana of >てき).
+            assert_eq!(preedit_string(ctx), ">てき");
+            assert_eq!(take_output(ctx), None);
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_marker_in_the_candidate_window_confirms_the_selection_and_is_buffered() {
+        // D-09 miss: the selected candidate is confirmed and committed by the D-12
+        // flush, then `>` is buffered.
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_trigger(ctx); // reselection
+            sekka_context_trigger(ctx); // next candidate (カ)
+            assert_eq!(preedit_string(ctx), "カ");
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("カ".to_string()));
+            assert_eq!(preedit_string(ctx), ">");
+            assert_eq!(sekka_context_get_candidate_count(ctx), 0);
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_marker_with_modifiers_and_the_full_width_marker_keep_their_paths() {
+        // E5: the full-width ＞ (Unicode keysym 0x100FF1E) is not the marker: it stays
+        // on the D-03 commit-and-forward path. Alt-> keeps D-185, Ctrl-> keeps D-03.
+        unsafe {
+            let ctx = sekka_context_new();
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            assert_eq!(sekka_context_process_key_event(ctx, 0x100FF1E, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("a".to_string()));
+            assert_eq!(sekka_context_take_forward_key(ctx), 1);
+            sekka_context_free(ctx);
+
+            let ctx = sekka_context_new();
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, MOD_ALT, 0), 1);
+            assert_eq!(take_output(ctx), Some(">".to_string()));
+            assert_eq!(preedit_string(ctx), "");
+            sekka_context_free(ctx);
+
+            let ctx = sekka_context_new();
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, MOD_CTRL, 0), 0);
+            assert_eq!(take_output(ctx), None);
+            assert_eq!(preedit_string(ctx), "");
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_slash_separator_still_holds_after_a_marked_buffer() {
+        // N2: `/` with something in the buffer commits it as typed and holds the `/`.
+        unsafe {
+            let ctx = sekka_context_new();
+            sekka_context_process_key_event(ctx, b'a' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, 0x3E, 0, 0);
+            assert_eq!(sekka_context_process_key_event(ctx, 0x2F, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("a>".to_string()));
+            assert_eq!(preedit_string(ctx), "/");
+            sekka_context_free(ctx);
+        }
+    }
+
+    #[test]
+    fn the_marker_during_registration_keeps_going_into_the_word() {
+        // Out of scope (M5): inside word registration `>` keeps its D-158/D-177
+        // handling - appended to what the inner step commits, or inserted into the
+        // word when the inner step has nothing.
+        unsafe {
+            let ctx = make_commit_display_state();
+            sekka_context_process_key_event(ctx, b'r' as u32, 0x4, 0);
+
+            sekka_context_process_key_event(ctx, b'K' as u32, 0, 0);
+            sekka_context_process_key_event(ctx, b'i' as u32, 0, 0);
+            sekka_context_trigger(ctx);
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(preedit_string(ctx), "き>");
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(preedit_string(ctx), "き>>");
+            sekka_context_process_key_event(ctx, b'k' as u32, 0, 0);
+            assert_eq!(sekka_context_process_key_event(ctx, 0x3E, 0, 0), 1);
+            assert_eq!(preedit_string(ctx), "き>>k>");
+            assert_eq!(take_output(ctx), None);
+
+            assert_eq!(sekka_context_process_key_event(ctx, 0xFF0D, 0, 0), 1);
+            assert_eq!(take_output(ctx), Some("き>>k>".to_string()));
             sekka_context_free(ctx);
         }
     }

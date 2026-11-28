@@ -12,7 +12,9 @@ use crate::candidate::{
     alphabet_hankaku_candidate, alphabet_zenkaku_candidate, build_candidates, hiragana_candidate,
     katakana_candidate, match_stage, sharp_number, sort_candidates, Candidate, CandidateKind,
 };
-use crate::conversion::{analyze_input, classify_input_shape, split_okuri, InputShape};
+use crate::conversion::{
+    analyze_input, classify_input_shape, split_okuri, ConversionMode, InputShape,
+};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -31,6 +33,28 @@ use crate::symspell;
 /// (JW<1.0) and break the ordering inside tier 1. No distance-based normalized value
 /// is used (03.1-01 Open Questions 2 RESOLVED).
 const SYMSPELL_TIER_SCORE: f64 = 1.0;
+
+/// The prefix/suffix marker of SKK dictionaries (M005)
+///
+/// SKK-JISYO marks a prefix reading with a trailing `>` (`ちょう> /超/`) and a
+/// suffix reading with a leading `>` (`>てき /的/`). Sekka buffers a typed `>` as
+/// part of the romaji (see `dispatch_input` in capi.rs) and only interprets it at
+/// Ctrl-J: a buffer containing it is looked up as one whole reading, exact match
+/// only (`build_affix_candidates`).
+pub(crate) const AFFIX_MARKER: char = '>';
+
+/// Whether a dictionary key is a prefix/suffix reading (contains `AFFIX_MARKER`)
+///
+/// Such keys are reached only by exact lookup from an input that itself contains
+/// the marker. Every fuzzy path of an ordinary conversion (SymSpell and the romaji
+/// Jaro-Winkler search, for the master dictionary and the user dictionary alike)
+/// skips them in `lookup_dictionary`, so their words never leak into ordinary
+/// candidate lists and are never learned under a marked reading by accident. The
+/// dictionary files and their indexes are left as they are (existing master
+/// dictionaries and user dictionaries keep working unchanged).
+fn is_affix_key(key: &str) -> bool {
+    key.contains(AFFIX_MARKER)
+}
 
 /// Conversion state - the current state of the input context
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1561,6 +1585,13 @@ impl SekkaContext {
     /// The real-time guide builds the same list as Ctrl-J for the romaji typed so far
     /// without touching the buffer (D-232).
     fn build_candidate_list_for(&self, romaji: &str) -> (Vec<Candidate>, String) {
+        // M005: a buffer containing the prefix/suffix marker is looked up as one
+        // whole reading before any shape classification (it would otherwise fall
+        // into the symbol branch). Registration is not offered for such a reading
+        // (D-169 refuses ASCII readings anyway), so the registration reading is empty.
+        if romaji.contains(AFFIX_MARKER) {
+            return (self.build_affix_candidates(romaji), String::new());
+        }
         match classify_input_shape(romaji) {
             InputShape::CaseBased | InputShape::HiraganaConvertible => {
                 let request = analyze_input(romaji);
@@ -1686,6 +1717,32 @@ impl SekkaContext {
 
         list.push(alphabet_zenkaku_candidate(raw_input));
         list.push(alphabet_hankaku_candidate(raw_input));
+        list
+    }
+
+    /// Candidate building for input containing the prefix/suffix marker `>` (M005)
+    ///
+    /// The whole buffer (kana plus `>`) is one reading: `chou>` -> `ちょう>`, `>teki`
+    /// -> `>てき`, `>` -> `>`, `chou>kousoku` -> `ちょう>こうそく`. `romaji_to_kana`
+    /// passes the `>` through unchanged, and an `n` right before it becomes `ん`
+    /// exactly as before any other symbol (`kan>` -> `かん>`). Only exact matches
+    /// from every dictionary (master and user) are taken; no SymSpell and no
+    /// Jaro-Winkler search is run on a marked reading (M9). The D-05 generated
+    /// candidates (hiragana, katakana, full-width and half-width romaji as typed) are
+    /// always appended, so a reading the dictionaries do not have still converts like
+    /// any unknown word. The list is sorted with the kanji-first group order, so a
+    /// dictionary word (超, 的) is the first candidate even for lowercase input, and
+    /// the last-selected order of learning applies within the dictionary group.
+    /// Learning goes through the dictionary key (`learn_pair`), i.e. the marked
+    /// reading.
+    fn build_affix_candidates(&self, romaji: &str) -> Vec<Candidate> {
+        let reading = romaji_to_kana(&romaji.to_ascii_lowercase());
+        let mut list = self.lookup_dictionary_exact(&reading);
+        list.push(hiragana_candidate(&reading));
+        list.push(katakana_candidate(&reading));
+        list.push(alphabet_zenkaku_candidate(romaji));
+        list.push(alphabet_hankaku_candidate(romaji));
+        sort_candidates(&mut list, ConversionMode::KanjiConvert);
         list
     }
 
@@ -1836,7 +1893,10 @@ impl SekkaContext {
         // Path 2: a delete variant of stem_kana is itself a dictionary key (distance fixed
         // at 1; upstream does not recompute here, since a single deletion makes distance 1 obvious).
         for variant in symspell::delete_variants(stem_kana) {
-            if variant == exact_key || symspell_seen.contains_key(&variant) {
+            if variant == exact_key
+                || symspell_seen.contains_key(&variant)
+                || is_affix_key(&variant)
+            {
                 continue;
             }
             for dict in &self.dictionaries {
@@ -1854,7 +1914,9 @@ impl SekkaContext {
         // (the case where the dictionary key is one character longer than stem_kana).
         for dict in &self.dictionaries {
             for key in dict.symspell_bucket(stem_kana).unwrap_or_default() {
-                if key == exact_key || symspell_seen.contains_key(&key) {
+                // M005: prefix/suffix keys (`あの>`, `>てき`) are never fuzzy hits of an
+                // ordinary reading (here, `あの` would reach `あの>` at distance 1).
+                if key == exact_key || symspell_seen.contains_key(&key) || is_affix_key(&key) {
                     continue;
                 }
                 // False positives from hash collisions are dropped here (D-92). Distance 0
@@ -1874,7 +1936,7 @@ impl SekkaContext {
         for variant in symspell::delete_variants(stem_kana) {
             for dict in &self.dictionaries {
                 for key in dict.symspell_bucket(&variant).unwrap_or_default() {
-                    if key == exact_key || symspell_seen.contains_key(&key) {
+                    if key == exact_key || symspell_seen.contains_key(&key) || is_affix_key(&key) {
                         continue;
                     }
                     let dist = strsim::levenshtein(stem_kana, &key);
@@ -1935,8 +1997,9 @@ impl SekkaContext {
         for dict in &self.dictionaries {
             if let Ok(results) = dict.roman_bucket(&prefix) {
                 for rk in results {
-                    // Exclude keys already handled by exact matching.
-                    if rk.reading != exact_key {
+                    // Exclude keys already handled by exact matching, and (M005) the
+                    // prefix readings the romaji index holds (`ちょう>` as `chou>`).
+                    if rk.reading != exact_key && !is_affix_key(&rk.reading) {
                         bucket.push(rk);
                     }
                 }
@@ -6786,5 +6849,274 @@ mod tests {
         assert_eq!(ctx.poll_output(), Some("石火".to_string()));
         let entries = user_dict.lookup("せっか").expect("lookup failed");
         assert_eq!(entries[0].word, "石火", "{:?}", entries);
+    }
+
+    // === M005: the prefix/suffix marker `>` ===
+
+    /// Types `input` one character at a time, presses Ctrl-J and returns every
+    /// candidate display of the staged list (the list `begin_reselect` restores).
+    fn affix_displays(ctx: &mut SekkaContext, input: &str) -> Vec<String> {
+        commit_then_reselect(ctx, input);
+        ctx.get_candidates()
+            .iter()
+            .map(|c| c.display.clone())
+            .collect()
+    }
+
+    /// A real-format master dictionary (write_dict + mmap, so the SymSpell and romaji
+    /// indexes exist exactly as in production) holding prefix/suffix keys next to
+    /// ordinary keys, mirroring SKK-JISYO.L (`あの> /彼の/`, `>てき /的/`,
+    /// `ちょう> /超/長/`, `> /〉/`, `かん> /寒/`).
+    fn affix_master_dict(tmp: &Path) -> ImmutableFileDict {
+        let mut entries: BTreeMap<String, Vec<DictEntry>> = BTreeMap::new();
+        entries.insert("あの>".to_string(), vec![DictEntry::new("彼の")]);
+        entries.insert(">てき".to_string(), vec![DictEntry::new("的")]);
+        entries.insert(
+            "ちょう>".to_string(),
+            vec![DictEntry::new("超"), DictEntry::new("長")],
+        );
+        entries.insert(">".to_string(), vec![DictEntry::new("〉")]);
+        entries.insert("かん>".to_string(), vec![DictEntry::new("寒")]);
+        entries.insert("ちょ>".to_string(), vec![DictEntry::new("著")]);
+        entries.insert("ちょう".to_string(), vec![DictEntry::new("蝶")]);
+        entries.insert("てき".to_string(), vec![DictEntry::new("敵")]);
+        let path = tmp.join("affix.dict");
+        dict_format::write_dict(&path, &entries).expect("write_dict failed");
+        ImmutableFileDict::open(&path).expect("failed to open the dictionary")
+    }
+
+    #[test]
+    fn a_prefix_reading_is_looked_up_as_one_whole_reading_with_the_dictionary_word_first() {
+        // SC1: `chou>` Ctrl-J looks up ちょう> exactly; the dictionary words lead even
+        // for lowercase input, then the D-05 generated candidates follow.
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(affix_master_dict(tmp.path())));
+
+        let staged = commit_then_reselect(&mut ctx, "chou>");
+        assert_eq!(staged, "超");
+        let displays: Vec<String> = ctx
+            .get_candidates()
+            .iter()
+            .map(|c| c.display.clone())
+            .collect();
+        assert_eq!(
+            displays,
+            vec!["超", "長", "ちょう>", "チョウ>", "ｃｈｏｕ＞", "chou>"],
+            "no fuzzy hit (著 of ちょ>, 蝶 of ちょう) may join a marked reading (M9)"
+        );
+        // E6: Ctrl-J during reselection cycles through the prefix candidates.
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "長");
+    }
+
+    #[test]
+    fn a_suffix_reading_and_a_lone_marker_are_looked_up_exactly() {
+        // SC2 / E1: `>teki` -> >てき (的), `>` alone -> > (〉).
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(affix_master_dict(tmp.path())));
+
+        let displays = affix_displays(&mut ctx, ">teki");
+        assert_eq!(
+            displays,
+            vec!["的", ">てき", ">テキ", "＞ｔｅｋｉ", ">teki"]
+        );
+        ctx.reset();
+
+        let displays = affix_displays(&mut ctx, ">");
+        assert_eq!(displays, vec!["〉", ">", ">", "＞", ">"]);
+    }
+
+    #[test]
+    fn n_before_the_marker_becomes_n_kana_and_an_unknown_marked_reading_gets_generated_candidates()
+    {
+        // E2: `kan>` reads かん>. SC1: `chou>kousoku` is one reading ちょう>こうそく; the
+        // dictionary does not have it, so only the D-05 generated candidates appear.
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(affix_master_dict(tmp.path())));
+
+        let displays = affix_displays(&mut ctx, "kan>");
+        assert_eq!(displays, vec!["寒", "かん>", "カン>", "ｋａｎ＞", "kan>"]);
+        ctx.reset();
+
+        let displays = affix_displays(&mut ctx, "chou>kousoku");
+        assert_eq!(
+            displays,
+            vec![
+                "ちょう>こうそく",
+                "チョウ>コウソク",
+                "ｃｈｏｕ＞ｋｏｕｓｏｋｕ",
+                "chou>kousoku"
+            ]
+        );
+    }
+
+    #[test]
+    fn backspace_after_a_prefix_conversion_reverts_to_its_romaji() {
+        // E8 / D-160: the staged prefix reverts to its raw romaji `chou>` (and, as
+        // D-160 does for every staged word, its last character is deleted).
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(affix_master_dict(tmp.path())));
+
+        for ch in "chou>".chars() {
+            ctx.process_key(ch, false);
+        }
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "超");
+        assert!(ctx.backspace());
+        assert_eq!(ctx.get_preedit(), "chou");
+        assert!(ctx.poll_output().is_none());
+        ctx.process_key('>', false);
+        ctx.process_key('\0', true);
+        assert_eq!(ctx.get_preedit(), "超");
+    }
+
+    #[test]
+    fn a_marked_buffer_committed_without_ctrl_j_is_the_typed_text() {
+        // SC3 / N1: without Ctrl-J the buffer goes out exactly as typed, the same
+        // string D-158 used to commit (`a` then `>` appended, then `b` ...).
+        let mut ctx = SekkaContext::new();
+        for ch in "a>b".chars() {
+            ctx.process_key(ch, false);
+        }
+        assert_eq!(ctx.get_preedit(), "a>b");
+        assert!(ctx.commit_with_trailing_char(' '));
+        assert_eq!(ctx.poll_output(), Some("a>b ".to_string()));
+
+        ctx.process_key('>', false);
+        assert!(ctx.commit_with_trailing_char(' '));
+        assert_eq!(ctx.poll_output(), Some("> ".to_string()));
+
+        ctx.process_key('>', false);
+        assert!(ctx.commit_raw_romaji());
+        assert_eq!(ctx.poll_output(), Some(">".to_string()));
+    }
+
+    #[test]
+    fn prefix_and_suffix_keys_never_leak_into_an_ordinary_conversion_of_the_master_dictionary() {
+        // SC4: before M005, `ano` reached あの> through SymSpell path 3 (deleting the
+        // `>` gives あの), `teki` reached >てき the same way, and `chou` reached ちょう>
+        // through SymSpell and the romaji index (`chou>`). None of those words may
+        // appear in an ordinary conversion now.
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let mut ctx = SekkaContext::new();
+        ctx.add_dictionary(Arc::new(affix_master_dict(tmp.path())));
+
+        for (input, leaked) in [
+            ("ano", "彼の"),
+            ("Ano", "彼の"),
+            ("teki", "的"),
+            ("Teki", "的"),
+            ("chou", "超"),
+            ("Chou", "長"),
+            ("Cho", "著"),
+        ] {
+            let displays = affix_displays(&mut ctx, input);
+            assert!(
+                !displays.iter().any(|d| d == leaked),
+                "{} must not offer {} (a prefix/suffix-only word): {:?}",
+                input,
+                leaked,
+                displays
+            );
+            ctx.reset();
+        }
+        // The ordinary words themselves are still found.
+        assert!(affix_displays(&mut ctx, "Teki").contains(&"敵".to_string()));
+        ctx.reset();
+        assert!(affix_displays(&mut ctx, "Chou").contains(&"蝶".to_string()));
+    }
+
+    #[test]
+    fn marked_records_in_the_user_dictionary_are_kept_and_used_only_by_marked_conversions() {
+        // SC4 / N5: a record an older version learned under あの> stays in the user
+        // dictionary untouched; it no longer reaches the ordinary `ano` conversion
+        // through the user dictionary's own SymSpell/romaji index, but a marked
+        // conversion `ano>` still finds it.
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        user_dict
+            .record_selection("あの>", "彼の")
+            .expect("record_selection failed");
+        user_dict
+            .record_selection("ちょう>", "超")
+            .expect("record_selection failed");
+
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![user_dict.clone()]);
+
+        for (input, leaked) in [("ano", "彼の"), ("Ano", "彼の"), ("Chou", "超")] {
+            let displays = affix_displays(&mut ctx, input);
+            assert!(
+                !displays.iter().any(|d| d == leaked),
+                "{} must not offer {} from the user dictionary: {:?}",
+                input,
+                leaked,
+                displays
+            );
+            ctx.reset();
+        }
+        assert_eq!(commit_then_reselect(&mut ctx, "ano>"), "彼の");
+        ctx.reset();
+
+        let kept = user_dict.lookup("あの>").expect("lookup failed");
+        assert_eq!(kept.len(), 1, "{:?}", kept);
+        assert_eq!(kept[0].word, "彼の");
+    }
+
+    #[test]
+    fn learning_uses_the_marked_reading_only_for_a_marked_conversion() {
+        // SC1: committing 超 learns it under ちょう> (and promotes 長 after it was
+        // chosen). SC4: an ordinary conversion never learns under a marked reading.
+        let tmp = tempfile::tempdir().expect("failed to create a temporary directory");
+        let user_dict = Arc::new(
+            UserDict::open(tmp.path().join("user_dict"))
+                .expect("failed to open the user dictionary"),
+        );
+        let mut ctx = SekkaContext::new();
+        ctx.set_dictionaries(vec![
+            Arc::new(affix_master_dict(tmp.path())),
+            user_dict.clone(),
+        ]);
+
+        // Choose 長 for `chou>` and commit it with the next key (D-12).
+        commit_then_reselect(&mut ctx, "chou>");
+        ctx.next_candidate();
+        ctx.confirm();
+        assert!(ctx.flush_last_commit());
+        assert_eq!(ctx.poll_output(), Some("長".to_string()));
+        let learned = user_dict.lookup("ちょう>").expect("lookup failed");
+        assert_eq!(learned[0].word, "長", "{:?}", learned);
+        assert_eq!(commit_then_reselect(&mut ctx, "chou>"), "長");
+        ctx.reset();
+
+        // Every candidate of the ordinary `Ano` / `Teki` conversions, once chosen and
+        // committed, is learned under a reading without the marker.
+        for input in ["Ano", "Teki", "Chou"] {
+            let count = affix_displays(&mut ctx, input).len();
+            ctx.reset();
+            for index in 0..count {
+                commit_then_reselect(&mut ctx, input);
+                for _ in 0..index {
+                    ctx.next_candidate();
+                }
+                ctx.confirm();
+                ctx.flush_last_commit();
+                ctx.poll_output();
+            }
+        }
+        let all = user_dict.prefix_search("").expect("prefix_search failed");
+        let marked: Vec<&String> = all
+            .iter()
+            .map(|(reading, _)| reading)
+            .filter(|reading| reading.contains('>'))
+            .collect();
+        assert_eq!(marked, vec!["ちょう>"], "{:?}", all);
     }
 }
